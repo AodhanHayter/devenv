@@ -1,0 +1,5 @@
+{
+  "name": "test-plugin",
+  "description": "A test plugin for integration testing",
+  "version": "1.0.0"
+}
