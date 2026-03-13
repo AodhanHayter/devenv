@@ -352,31 +352,34 @@ Add plugin sources as devenv inputs in `devenv.yaml`:
 
 ```yaml
 inputs:
-  claude-code-plugins:
-    github: anthropics/claude-code
+  compound-engineering:
+    url: github:EveryInc/compound-engineering-plugin
+    flake: false
   my-custom-plugin:
-    github: someone/their-claude-plugin
+    url: github:someone/their-claude-plugin
+    flake: false
 ```
 
-Then reference them in `devenv.nix`:
+Then reference them in `devenv.nix`. The attribute name should match the plugin name (as defined in the plugin's `plugin.json`):
 
 ```nix
 {
   claude.code.plugins = {
-    # Single-plugin repo (auto-detects .claude-plugin/plugin.json)
+    # Marketplace repo — plugin name matches the attr name,
+    # resolved automatically via marketplace.json
+    compound-engineering = {
+      src = inputs.compound-engineering;
+    };
+
+    # Single-plugin repo (auto-detects .claude-plugin/plugin.json at root)
     my-custom-plugin = {
       src = inputs.my-custom-plugin;
     };
 
-    # Multi-plugin repo (specify subdir)
-    pr-review = {
-      src = inputs.claude-code-plugins;
+    # Explicit subdir when auto-detection can't resolve
+    pr-review-toolkit = {
+      src = inputs.some-monorepo;
       subdir = "plugins/pr-review-toolkit";
-    };
-
-    commit-commands = {
-      src = inputs.claude-code-plugins;
-      subdir = "plugins/commit-commands";
     };
 
     # Local plugin
@@ -387,19 +390,21 @@ Then reference them in `devenv.nix`:
 }
 ```
 
+Note: Plugin repos that don't have a `flake.nix` (most plugin repos) need `flake: false` in `devenv.yaml`.
+
 ### How It Works
 
 devenv generates a local marketplace directory and configures `settings.json` so Claude Code auto-installs the plugins on first session. Plugin versions are pinned by your flake lock file — run `devenv update` to get new versions.
 
-### Auto-Detection
+### Plugin Resolution
 
-When `subdir` is omitted, devenv searches the source for `.claude-plugin/plugin.json`:
+When `subdir` is omitted, devenv resolves the plugin directory automatically:
 
-1. At the source root
-2. One level deep
-3. Two levels deep (handles `plugins/<name>/.claude-plugin/` layouts)
+1. If the source root has `.claude-plugin/plugin.json` — uses root (single-plugin repos)
+2. If the source root has `.claude-plugin/marketplace.json` — looks up the plugin by attribute name, just like `/plugin install <name>` (marketplace repos)
+3. Falls back to scanning 1–2 levels deep for `.claude-plugin/plugin.json`
 
-If multiple plugins are found, you must specify `subdir`.
+If multiple plugins are found and none match the attribute name, specify `subdir` explicitly.
 
 ### Disabling Plugins
 

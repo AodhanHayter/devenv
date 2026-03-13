@@ -119,12 +119,35 @@ let
   };
 
   # Resolve the plugin directory from a plugin config entry.
-  # Searches for .claude-plugin/plugin.json at root, then 1 level, then 2 levels deep.
+  # Priority: subdir > root plugin.json > marketplace.json lookup > directory scan.
   resolvePluginDir = name: pluginCfg:
     let
       src = pluginCfg.src;
       hasManifest = dir: builtins.pathExists (dir + "/.claude-plugin/plugin.json");
 
+      # Marketplace.json lookup: resolve plugin name to source path
+      marketplacePath = src + "/.claude-plugin/marketplace.json";
+      hasMarketplace = builtins.pathExists marketplacePath;
+      marketplace =
+        if hasMarketplace
+        then builtins.fromJSON (builtins.readFile marketplacePath)
+        else null;
+      marketplaceMatch =
+        if marketplace != null then
+          let
+            matches = builtins.filter (p: p.name == name) (marketplace.plugins or [ ]);
+          in
+          if builtins.length matches == 1 then
+            let
+              relPath = (builtins.head matches).source;
+              # Strip leading "./" from relative paths
+              cleanPath = lib.removePrefix "./" relPath;
+            in
+            src + "/${cleanPath}"
+          else null
+        else null;
+
+      # Directory scan fallback
       level1Entries = builtins.readDir src;
       level1Dirs = builtins.attrNames (lib.filterAttrs (_: v: v == "directory") level1Entries);
       level1Hits = builtins.filter (d: hasManifest (src + "/${d}")) level1Dirs;
@@ -146,6 +169,7 @@ let
       if hasManifest dir then dir
       else throw "claude.code.plugins.${name}: no .claude-plugin/plugin.json at subdir '${pluginCfg.subdir}'"
     else if hasManifest src then src
+    else if marketplaceMatch != null then marketplaceMatch
     else if builtins.length allCandidates == 1 then src + "/${builtins.head allCandidates}"
     else if builtins.length allCandidates > 1 then
       throw "claude.code.plugins.${name}: multiple plugins found (${lib.concatStringsSep ", " allCandidates}), set 'subdir'"
