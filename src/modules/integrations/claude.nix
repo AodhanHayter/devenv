@@ -98,6 +98,86 @@ let
     };
   };
 
+  # Plugin submodule type
+  pluginSubmodule = lib.types.submodule {
+    options = {
+      src = lib.mkOption {
+        type = lib.types.path;
+        description = "Path to plugin source (flake input or local path).";
+      };
+      subdir = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Subdirectory within src containing the plugin. Auto-detected if omitted.";
+      };
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Whether to enable this plugin.";
+      };
+    };
+  };
+
+  # Resolve the plugin directory from a plugin config entry.
+  # Searches for .claude-plugin/plugin.json at root, then 1 level, then 2 levels deep.
+  resolvePluginDir = name: pluginCfg:
+    let
+      src = pluginCfg.src;
+      hasManifest = dir: builtins.pathExists (dir + "/.claude-plugin/plugin.json");
+
+      level1Entries = builtins.readDir src;
+      level1Dirs = builtins.attrNames (lib.filterAttrs (_: v: v == "directory") level1Entries);
+      level1Hits = builtins.filter (d: hasManifest (src + "/${d}")) level1Dirs;
+      level2Hits = lib.concatMap
+        (d1:
+          let
+            entries = builtins.readDir (src + "/${d1}");
+            dirs = builtins.attrNames (lib.filterAttrs (_: v: v == "directory") entries);
+          in
+          builtins.filter (d2: hasManifest (src + "/${d1}/${d2}"))
+            (map (d2: "${d1}/${d2}") dirs)
+        )
+        level1Dirs;
+      allCandidates = level1Hits ++ level2Hits;
+    in
+    if pluginCfg.subdir != null then
+      let dir = src + "/${pluginCfg.subdir}";
+      in
+      if hasManifest dir then dir
+      else throw "claude.code.plugins.${name}: no .claude-plugin/plugin.json at subdir '${pluginCfg.subdir}'"
+    else if hasManifest src then src
+    else if builtins.length allCandidates == 1 then src + "/${builtins.head allCandidates}"
+    else if builtins.length allCandidates > 1 then
+      throw "claude.code.plugins.${name}: multiple plugins found (${lib.concatStringsSep ", " allCandidates}), set 'subdir'"
+    else
+      throw "claude.code.plugins.${name}: no .claude-plugin/plugin.json found in source";
+
+  # Read plugin.json metadata; falls back to deriving name from directory.
+  readPluginMeta = name: dir:
+    let path = dir + "/.claude-plugin/plugin.json";
+    in
+    if builtins.pathExists path
+    then builtins.fromJSON (builtins.readFile path)
+    else { name = builtins.baseNameOf (toString dir); };
+
+  # Warn about MCP servers that require binaries in PATH.
+  pluginMcpWarnings = name: dir:
+    let
+      mcpPath = dir + "/.mcp.json";
+    in
+    if builtins.pathExists mcpPath then
+      let
+        content = builtins.fromJSON (builtins.readFile mcpPath);
+        servers = content.mcpServers or { };
+      in
+      lib.concatLists (lib.mapAttrsToList
+        (sname: srv:
+          lib.optional (srv ? command)
+            "Plugin '${name}' MCP server '${sname}' requires binary '${srv.command}' in PATH"
+        )
+        servers)
+    else [ ];
+
   # Build hooks configuration
   buildHooks =
     hookType: hooks:
@@ -194,6 +274,43 @@ let
     )
     cfg.mcpServers;
 
+  # Resolve enabled plugins
+  enabledPluginsCfg = lib.filterAttrs (_: p: p.enable) cfg.plugins;
+
+  resolvedPlugins = lib.mapAttrs
+    (name: pluginCfg:
+      let
+        dir = resolvePluginDir name pluginCfg;
+        meta = readPluginMeta name dir;
+      in
+      { inherit dir meta; pluginName = meta.name; })
+    enabledPluginsCfg;
+
+  # Assert no duplicate plugin names
+  pluginNames = lib.mapAttrsToList (_: rp: rp.pluginName) resolvedPlugins;
+  pluginNamesUnique =
+    builtins.length pluginNames == builtins.length (lib.unique pluginNames)
+    || throw "claude.code.plugins: duplicate plugin names: ${lib.concatStringsSep ", " pluginNames}";
+
+  hasPlugins = enabledPluginsCfg != { } && pluginNamesUnique;
+
+  marketplaceJson = {
+    name = "devenv-plugins";
+    owner = { name = "devenv"; };
+    plugins = lib.mapAttrsToList
+      (_: rp: {
+        name = rp.pluginName;
+        source = "./plugins/${rp.pluginName}";
+        description = rp.meta.description or "";
+        version = rp.meta.version or "0.0.0";
+      })
+      resolvedPlugins;
+  };
+
+  allPluginWarnings = lib.concatLists (
+    lib.mapAttrsToList (name: rp: pluginMcpWarnings name rp.dir) resolvedPlugins
+  );
+
   # Generate the settings content
   settingsContent = lib.filterAttrs (n: v: v != null) {
     hooks = lib.filterAttrs (n: v: v != null) {
@@ -223,6 +340,23 @@ let
       ;
     env = if cfg.env == { } then null else cfg.env;
     permissions = buildPermissions;
+    extraKnownMarketplaces =
+      if hasPlugins then {
+        devenv-plugins.source = {
+          source = "directory";
+          path = "${config.devenv.root}/.devenv/claude-marketplace";
+        };
+      } else null;
+    enabledPlugins =
+      if hasPlugins then
+        lib.listToAttrs
+          (lib.mapAttrsToList
+            (_: rp: {
+              name = "${rp.pluginName}@devenv-plugins";
+              value = true;
+            })
+            resolvedPlugins)
+      else null;
   };
 
   # Generate the MCP configuration content
@@ -616,6 +750,24 @@ in
       '';
     };
 
+    plugins = lib.mkOption {
+      type = lib.types.attrsOf pluginSubmodule;
+      default = { };
+      description = ''
+        Claude Code plugins from flake inputs or local paths.
+        Plugins are auto-installed via a generated local marketplace.
+      '';
+      example = lib.literalExpression ''
+        {
+          my-plugin.src = inputs.my-plugin;
+          pr-review = {
+            src = inputs.claude-code-plugins;
+            subdir = "plugins/pr-review-toolkit";
+          };
+        }
+      '';
+    };
+
     settingsPath = lib.mkOption {
       type = lib.types.str;
       default = "${config.devenv.root}/.claude/settings.json";
@@ -679,7 +831,21 @@ in
             };
           })
           cfg.agents)
+
+        # Plugin marketplace directory
+        (lib.mkIf hasPlugins (
+          {
+            ".devenv/claude-marketplace/.claude-plugin/marketplace.json".json = marketplaceJson;
+          } // lib.mapAttrs'
+            (_: rp: {
+              name = ".devenv/claude-marketplace/plugins/${rp.pluginName}";
+              value = { source = rp.dir; };
+            })
+            resolvedPlugins
+        ))
       ];
+
+      warnings = lib.mkIf hasPlugins allPluginWarnings;
 
       # Add a message about the integration
       infoSections."claude" = [
@@ -701,6 +867,11 @@ in
             "- MCP servers: ${
               lib.concatStringsSep ", " (lib.attrNames cfg.mcpServers)
             } (configured at ${config.devenv.root}/.mcp.json)"
+          }
+          ${lib.optionalString hasPlugins
+            "- Plugins: ${
+              lib.concatStringsSep ", " (lib.mapAttrsToList (_: rp: rp.pluginName) resolvedPlugins)
+            }"
           }
         ''
       ];
