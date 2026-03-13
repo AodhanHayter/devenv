@@ -342,6 +342,81 @@ MCP (Model Context Protocol) servers provide additional capabilities and context
 
 When MCP servers are configured, devenv generates a `.mcp.json` file that Claude Code uses to connect to these servers.
 
+## Plugins
+
+[Claude Code plugins](https://code.claude.com/docs/en/plugins) extend Claude with skills, agents, hooks, and MCP servers. The devenv integration lets you declare plugins from flake inputs or local paths — they're auto-installed with zero user interaction.
+
+### Adding Plugins
+
+Add plugin sources as devenv inputs in `devenv.yaml`:
+
+```yaml
+inputs:
+  claude-code-plugins:
+    github: anthropics/claude-code
+  my-custom-plugin:
+    github: someone/their-claude-plugin
+```
+
+Then reference them in `devenv.nix`:
+
+```nix
+{
+  claude.code.plugins = {
+    # Single-plugin repo (auto-detects .claude-plugin/plugin.json)
+    my-custom-plugin = {
+      src = inputs.my-custom-plugin;
+    };
+
+    # Multi-plugin repo (specify subdir)
+    pr-review = {
+      src = inputs.claude-code-plugins;
+      subdir = "plugins/pr-review-toolkit";
+    };
+
+    commit-commands = {
+      src = inputs.claude-code-plugins;
+      subdir = "plugins/commit-commands";
+    };
+
+    # Local plugin
+    team-tools = {
+      src = ./claude-plugins/team-tools;
+    };
+  };
+}
+```
+
+### How It Works
+
+devenv generates a local marketplace directory and configures `settings.json` so Claude Code auto-installs the plugins on first session. Plugin versions are pinned by your flake lock file — run `devenv update` to get new versions.
+
+### Auto-Detection
+
+When `subdir` is omitted, devenv searches the source for `.claude-plugin/plugin.json`:
+
+1. At the source root
+2. One level deep
+3. Two levels deep (handles `plugins/<name>/.claude-plugin/` layouts)
+
+If multiple plugins are found, you must specify `subdir`.
+
+### Disabling Plugins
+
+```nix
+{
+  claude.code.plugins.pr-review = {
+    src = inputs.claude-code-plugins;
+    subdir = "plugins/pr-review-toolkit";
+    enable = false;
+  };
+}
+```
+
+### MCP Binary Warnings
+
+If a plugin bundles MCP servers that require external binaries, devenv will emit warnings listing the required binary names. Add the binaries to your `packages` to resolve them.
+
 ## Composable Specialized Agents
 
 The [devenv-claude-agents](https://github.com/cachix/devenv-claude-agents) repository provides a composable collection of specialized agents:
