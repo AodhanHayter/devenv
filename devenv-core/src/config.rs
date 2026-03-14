@@ -902,7 +902,13 @@ impl Config {
     }
 
     /// Add a new input, overwriting any existing input with the same name.
-    pub fn add_input(&mut self, name: &str, url: &str, follows: &[String]) -> Result<()> {
+    pub fn add_input(
+        &mut self,
+        name: &str,
+        url: &str,
+        follows: &[String],
+        flake: bool,
+    ) -> Result<()> {
         // A set of inputs built from the follows list.
         let mut inputs = BTreeMap::new();
 
@@ -924,6 +930,7 @@ impl Config {
 
         let input = Input {
             url: Some(url.to_string()),
+            flake,
             inputs,
             ..Default::default()
         };
@@ -937,7 +944,7 @@ impl Config {
             input.url = Some(url.to_string());
             Ok(())
         } else if name == "nixpkgs" || name == "devenv" {
-            self.add_input(name, url, &[])
+            self.add_input(name, url, &[], true)
         } else {
             Err(miette::miette!(
                 "Input {name} does not exist so it can't be overridden."
@@ -1065,7 +1072,12 @@ mod tests {
     fn add_input() {
         let mut config = Config::default();
         config
-            .add_input("nixpkgs", "github:NixOS/nixpkgs/nixpkgs-unstable", &[])
+            .add_input(
+                "nixpkgs",
+                "github:NixOS/nixpkgs/nixpkgs-unstable",
+                &[],
+                true,
+            )
             .expect("Failed to add input");
         assert_eq!(config.inputs.len(), 1);
         assert_eq!(
@@ -1079,13 +1091,14 @@ mod tests {
     fn add_input_with_follows() {
         let mut config = Config::default();
         config
-            .add_input("other", "github:org/repo", &[])
+            .add_input("other", "github:org/repo", &[], true)
             .expect("Failed to add input");
         config
             .add_input(
                 "input-with-follows",
                 "github:org/repo",
                 &["nixpkgs".to_string(), "other".to_string()],
+                true,
             )
             .expect("Failed to add input with follows");
         assert_eq!(config.inputs.len(), 2);
@@ -1100,6 +1113,7 @@ mod tests {
             "input-with-follows",
             "github:org/repo",
             &["other".to_string()],
+            true,
         );
         let err = result.unwrap_err();
         assert!(
@@ -1110,10 +1124,29 @@ mod tests {
     }
 
     #[test]
+    fn add_input_no_flake() {
+        let mut config = Config::default();
+        config
+            .add_input("my-plugin", "github:someone/plugin", &[], false)
+            .expect("Failed to add input");
+        assert_eq!(config.inputs.len(), 1);
+        assert!(!config.inputs["my-plugin"].flake);
+        assert_eq!(
+            config.inputs["my-plugin"].url,
+            Some("github:someone/plugin".to_string())
+        );
+    }
+
+    #[test]
     fn override_input_url() {
         let mut config = Config::default();
         config
-            .add_input("nixpkgs", "github:NixOS/nixpkgs/nixpkgs-unstable", &[])
+            .add_input(
+                "nixpkgs",
+                "github:NixOS/nixpkgs/nixpkgs-unstable",
+                &[],
+                true,
+            )
             .expect("Failed to add input");
         assert_eq!(
             config.inputs["nixpkgs"].url,
