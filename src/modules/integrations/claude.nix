@@ -118,6 +118,10 @@ let
     };
   };
 
+  # Helpers for plugin resolution
+  readJSON = path: builtins.fromJSON (builtins.readFile path);
+  dirsIn = path: builtins.attrNames (lib.filterAttrs (_: v: v == "directory") (builtins.readDir path));
+
   # Resolve the plugin directory from a plugin config entry.
   # Priority: subdir > root plugin.json > marketplace.json lookup > directory scan.
   resolvePluginDir = name: pluginCfg:
@@ -130,38 +134,21 @@ let
       hasMarketplace = builtins.pathExists marketplacePath;
       marketplace =
         if hasMarketplace
-        then builtins.fromJSON (builtins.readFile marketplacePath)
+        then readJSON marketplacePath
         else null;
       marketplaceMatch =
         if marketplace != null then
           let
-            matches = builtins.filter (p: p.name == name) (marketplace.plugins or [ ]);
+            matches = lib.filter (p: p.name == name) (marketplace.plugins or [ ]);
           in
           if builtins.length matches == 1 then
             let
               relPath = (builtins.head matches).source;
-              # Strip leading "./" from relative paths
               cleanPath = lib.removePrefix "./" relPath;
             in
             src + "/${cleanPath}"
           else null
         else null;
-
-      # Directory scan fallback
-      level1Entries = builtins.readDir src;
-      level1Dirs = builtins.attrNames (lib.filterAttrs (_: v: v == "directory") level1Entries);
-      level1Hits = builtins.filter (d: hasManifest (src + "/${d}")) level1Dirs;
-      level2Hits = lib.concatMap
-        (d1:
-          let
-            entries = builtins.readDir (src + "/${d1}");
-            dirs = builtins.attrNames (lib.filterAttrs (_: v: v == "directory") entries);
-          in
-          builtins.filter (d2: hasManifest (src + "/${d1}/${d2}"))
-            (map (d2: "${d1}/${d2}") dirs)
-        )
-        level1Dirs;
-      allCandidates = level1Hits ++ level2Hits;
     in
     if pluginCfg.subdir != null then
       let dir = src + "/${pluginCfg.subdir}";
@@ -170,19 +157,27 @@ let
       else throw "claude.code.plugins.${name}: no .claude-plugin/plugin.json at subdir '${pluginCfg.subdir}'"
     else if hasManifest src then src
     else if marketplaceMatch != null then marketplaceMatch
-    else if builtins.length allCandidates == 1 then src + "/${builtins.head allCandidates}"
-    else if builtins.length allCandidates > 1 then
-      throw "claude.code.plugins.${name}: multiple plugins found (${lib.concatStringsSep ", " allCandidates}), set 'subdir'"
     else
-      throw "claude.code.plugins.${name}: no .claude-plugin/plugin.json found in source";
+    # Directory scan fallback (only evaluated if subdir/root/marketplace don't match)
+      let
+        level1Dirs = dirsIn src;
+        level1Hits = lib.filter (d: hasManifest (src + "/${d}")) level1Dirs;
+        level2Hits = lib.concatMap
+          (d1:
+            lib.filter (d2: hasManifest (src + "/${d1}/${d2}"))
+              (map (d2: "${d1}/${d2}") (dirsIn (src + "/${d1}")))
+          )
+          level1Dirs;
+        allCandidates = level1Hits ++ level2Hits;
+      in
+      if builtins.length allCandidates == 1 then src + "/${builtins.head allCandidates}"
+      else if builtins.length allCandidates > 1 then
+        throw "claude.code.plugins.${name}: multiple plugins found (${lib.concatStringsSep ", " allCandidates}), set 'subdir'"
+      else
+        throw "claude.code.plugins.${name}: no .claude-plugin/plugin.json found in source";
 
-  # Read plugin.json metadata; falls back to deriving name from directory.
-  readPluginMeta = name: dir:
-    let path = dir + "/.claude-plugin/plugin.json";
-    in
-    if builtins.pathExists path
-    then builtins.fromJSON (builtins.readFile path)
-    else { name = builtins.baseNameOf (toString dir); };
+  # Read plugin.json metadata from a resolved plugin directory.
+  readPluginMeta = dir: readJSON (dir + "/.claude-plugin/plugin.json");
 
   # Warn about MCP servers that require binaries in PATH.
   pluginMcpWarnings = name: dir:
@@ -191,8 +186,7 @@ let
     in
     if builtins.pathExists mcpPath then
       let
-        content = builtins.fromJSON (builtins.readFile mcpPath);
-        servers = content.mcpServers or { };
+        servers = (readJSON mcpPath).mcpServers or { };
       in
       lib.concatLists (lib.mapAttrsToList
         (sname: srv:
@@ -305,18 +299,12 @@ let
     (name: pluginCfg:
       let
         dir = resolvePluginDir name pluginCfg;
-        meta = readPluginMeta name dir;
+        meta = readPluginMeta dir;
       in
       { inherit dir meta; pluginName = meta.name; })
     enabledPluginsCfg;
 
-  # Assert no duplicate plugin names
-  pluginNames = lib.mapAttrsToList (_: rp: rp.pluginName) resolvedPlugins;
-  pluginNamesUnique =
-    builtins.length pluginNames == builtins.length (lib.unique pluginNames)
-    || throw "claude.code.plugins: duplicate plugin names: ${lib.concatStringsSep ", " pluginNames}";
-
-  hasPlugins = enabledPluginsCfg != { } && pluginNamesUnique;
+  hasPlugins = enabledPluginsCfg != { };
 
   marketplaceJson = {
     name = "devenv-plugins";
@@ -870,6 +858,17 @@ in
       ];
 
       warnings = lib.mkIf hasPlugins allPluginWarnings;
+
+      assertions = lib.mkIf hasPlugins [
+        {
+          assertion =
+            let names = lib.mapAttrsToList (_: rp: rp.pluginName) resolvedPlugins;
+            in builtins.length names == builtins.length (lib.unique names);
+          message = "claude.code.plugins: duplicate plugin names: ${
+            lib.concatStringsSep ", " (lib.mapAttrsToList (_: rp: rp.pluginName) resolvedPlugins)
+          }";
+        }
+      ];
 
       # Add a message about the integration
       infoSections."claude" = [
