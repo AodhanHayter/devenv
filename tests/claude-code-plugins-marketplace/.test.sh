@@ -9,8 +9,8 @@ test -L .devenv/claude-marketplace/plugins/my-plugin
 test -f .devenv/claude-marketplace/plugins/my-plugin/.claude-plugin/plugin.json
 test -f .devenv/claude-marketplace/plugins/my-plugin/skills/hello/SKILL.md
 
-# settings.json should have the plugin enabled
-cat .claude/settings.json | jq -e '.enabledPlugins["my-plugin@devenv-plugins"] == true'
+# settings.json should have the plugin enabled (marketplace name is hashed)
+cat .claude/settings.json | jq -e '[.enabledPlugins | to_entries[] | select(.key | startswith("my-plugin@devenv-"))] | length == 1'
 
 # marketplace.json should list only the enabled plugin, not "other-plugin"
 cat .devenv/claude-marketplace/.claude-plugin/marketplace.json | jq -e '.plugins | length == 1'
