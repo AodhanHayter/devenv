@@ -306,8 +306,12 @@ let
 
   hasPlugins = enabledPluginsCfg != { };
 
+  # Unique per-project marketplace name to avoid cross-project collisions
+  # in Claude Code's user-level known_marketplaces.json cache.
+  marketplaceId = "devenv-${builtins.substring 0 8 (builtins.hashString "sha256" config.devenv.root)}";
+
   marketplaceJson = {
-    name = "devenv-plugins";
+    name = marketplaceId;
     owner = { name = "devenv"; };
     plugins = lib.mapAttrsToList
       (_: rp: {
@@ -354,7 +358,7 @@ let
     permissions = buildPermissions;
     extraKnownMarketplaces =
       if hasPlugins then {
-        devenv-plugins.source = {
+        ${marketplaceId}.source = {
           source = "directory";
           path = "${config.devenv.root}/.devenv/claude-marketplace";
         };
@@ -364,7 +368,7 @@ let
         lib.listToAttrs
           (lib.mapAttrsToList
             (_: rp: {
-              name = "${rp.pluginName}@devenv-plugins";
+              name = "${rp.pluginName}@${marketplaceId}";
               value = true;
             })
             resolvedPlugins)
