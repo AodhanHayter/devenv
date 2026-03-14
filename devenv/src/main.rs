@@ -85,14 +85,20 @@ fn main_inner() -> Result<()> {
                 return commands::init::run(target.as_deref(), verbosity, *include_envrc);
             }
             Commands::Inputs {
-                command: InputsCommand::Add { name, url, follows },
+                command:
+                    InputsCommand::Add {
+                        name,
+                        url,
+                        follows,
+                        no_flake,
+                    },
             } => {
                 // `inputs add` is dispatched before `resolve()` runs discovery,
                 // so do it here too: edit the enclosing project's `devenv.yaml`
                 // (the one `devenv shell` would use) rather than silently
                 // creating a stray one in the current subdirectory.
                 enter_discovered_project_root()?;
-                return commands::inputs::add(name, url, follows);
+                return commands::inputs::add(name, url, follows, *no_flake);
             }
             _ => {}
         }
