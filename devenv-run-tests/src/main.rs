@@ -406,6 +406,7 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
                 "devenv",
                 &format!("git+file:{}?dir=src/modules", cwd.display()),
                 &[],
+                true,
             )
             .wrap_err("Failed to add devenv input")?;
 

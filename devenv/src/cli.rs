@@ -727,6 +727,9 @@ pub enum InputsCommand {
 
         #[arg(short, long, help = "What inputs should follow your inputs?")]
         follows: Vec<String>,
+
+        #[arg(long, help = "Mark input as non-flake (for repos without flake.nix).")]
+        no_flake: bool,
     },
 }
 

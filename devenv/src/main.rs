@@ -492,9 +492,14 @@ async fn run_backend(
     // Early-dispatch commands that only need Config (no Devenv construction required)
     if let Commands::Inputs { ref command } = command {
         match command {
-            InputsCommand::Add { name, url, follows } => {
+            InputsCommand::Add {
+                name,
+                url,
+                follows,
+                no_flake,
+            } => {
                 let mut config = config;
-                if let Err(e) = config.add_input(name, url, follows) {
+                if let Err(e) = config.add_input(name, url, follows, !*no_flake) {
                     return output(Err(e));
                 }
                 if let Err(e) = config.write().await {
