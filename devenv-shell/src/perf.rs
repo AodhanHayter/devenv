@@ -25,6 +25,13 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Also settable at runtime via `DEVENV_SHELL_LEGACY_RENDER`.
 static LEGACY: AtomicBool = AtomicBool::new(false);
 
+/// When set (the default), a batch that begins in the alternate screen is copied
+/// straight to the terminal instead of being re-rendered through the VT — so a
+/// nested full-screen app (nvim, claude-code) talks to the terminal directly and
+/// pays none of the per-frame cell readback / re-serialize cost. Disabled by
+/// `DEVENV_SHELL_PASSTHROUGH=0` and forced off by legacy mode.
+static PASSTHROUGH: AtomicBool = AtomicBool::new(true);
+
 struct Counters {
     /// `PtyOutput` batches processed (one render per batch).
     frames: AtomicU64,
@@ -52,6 +59,8 @@ struct Counters {
     /// Status-line draws skipped (content unchanged) — 0 until that optimization
     /// lands; lets a before/after show the win.
     status_skipped: AtomicU64,
+    /// Batches copied straight through (alt-screen passthrough) — no VT render.
+    passthrough_frames: AtomicU64,
     scan_ns: AtomicU64,
     vt_ns: AtomicU64,
     render_ns: AtomicU64,
@@ -72,6 +81,7 @@ static C: Counters = Counters {
     rows_skipped: AtomicU64::new(0),
     status_draws: AtomicU64::new(0),
     status_skipped: AtomicU64::new(0),
+    passthrough_frames: AtomicU64::new(0),
     scan_ns: AtomicU64::new(0),
     vt_ns: AtomicU64::new(0),
     render_ns: AtomicU64::new(0),
@@ -85,11 +95,19 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Read `DEVENV_SHELL_PERF` / `DEVENV_SHELL_LEGACY_RENDER` and arm the
-/// corresponding flags if set to a truthy value.
+fn env_falsy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "0" || v == "false")
+        .unwrap_or(false)
+}
+
+/// Read `DEVENV_SHELL_PERF` / `DEVENV_SHELL_LEGACY_RENDER` /
+/// `DEVENV_SHELL_PASSTHROUGH` and arm the corresponding flags. Passthrough is on
+/// unless explicitly set to `0`/`false`.
 pub fn init_from_env() {
     ENABLED.store(env_truthy("DEVENV_SHELL_PERF"), Relaxed);
     LEGACY.store(env_truthy("DEVENV_SHELL_LEGACY_RENDER"), Relaxed);
+    PASSTHROUGH.store(!env_falsy("DEVENV_SHELL_PASSTHROUGH"), Relaxed);
 }
 
 /// Force the profiler on/off (used by tests and benches).
@@ -110,6 +128,18 @@ pub fn set_legacy(on: bool) {
 #[inline]
 pub fn legacy() -> bool {
     LEGACY.load(Relaxed)
+}
+
+/// Force alt-screen passthrough on/off (benches/tests drive this).
+pub fn set_passthrough(on: bool) {
+    PASSTHROUGH.store(on, Relaxed);
+}
+
+/// Whether alt-screen passthrough is active. Off in legacy mode (which reverts to
+/// full VT re-render for a faithful before/after).
+#[inline]
+pub fn passthrough() -> bool {
+    PASSTHROUGH.load(Relaxed) && !LEGACY.load(Relaxed)
 }
 
 /// Structural per-run counters, read by benches to report the work done
@@ -136,6 +166,7 @@ pub fn reset() {
         &C.rows_skipped,
         &C.status_draws,
         &C.status_skipped,
+        &C.passthrough_frames,
         &C.scan_ns,
         &C.vt_ns,
         &C.render_ns,
@@ -196,6 +227,15 @@ pub fn record_status(drawn: bool) {
     } else {
         C.status_skipped.fetch_add(1, Relaxed);
     }
+}
+
+/// Record a batch that was copied straight through (alt-screen passthrough).
+#[inline]
+pub fn record_passthrough() {
+    if !enabled() {
+        return;
+    }
+    C.passthrough_frames.fetch_add(1, Relaxed);
 }
 
 #[inline]
@@ -289,6 +329,7 @@ pub fn dump() {
     let rows_skipped = C.rows_skipped.load(Relaxed);
     let status_draws = C.status_draws.load(Relaxed);
     let status_skipped = C.status_skipped.load(Relaxed);
+    let passthrough_frames = C.passthrough_frames.load(Relaxed);
     let scan_ms = C.scan_ns.load(Relaxed) as f64 / 1e6;
     let vt_ms = C.vt_ns.load(Relaxed) as f64 / 1e6;
     let render_ms = C.render_ns.load(Relaxed) as f64 / 1e6;
@@ -328,6 +369,11 @@ pub fn dump() {
     let mut out = String::new();
     out.push_str("\n┌─ devenv shell render perf ─────────────────────────────────\n");
     out.push_str(&format!(
+        "│ flags: passthrough={}  legacy={}\n",
+        passthrough(),
+        legacy(),
+    ));
+    out.push_str(&format!(
         "│ frames(batches): {frames}   chunks: {chunks}   coalesce: {coalesce:.1} chunks/frame\n"
     ));
     out.push_str(&format!(
@@ -356,6 +402,14 @@ pub fn dump() {
     ));
     out.push_str(&format!(
         "│ status draws: {status_draws}   skipped: {status_skipped}\n"
+    ));
+    out.push_str(&format!(
+        "│ passthrough batches: {passthrough_frames}  ({:.0}% of frames copied raw, no render)\n",
+        if frames > 0 {
+            passthrough_frames as f64 / frames as f64 * 100.0
+        } else {
+            0.0
+        },
     ));
     out.push_str("│ ── stage time (active processing) ─────────────────────────\n");
     out.push_str(&format!(

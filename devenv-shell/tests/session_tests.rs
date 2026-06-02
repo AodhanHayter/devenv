@@ -671,3 +671,48 @@ async fn test_print_watched_files() {
     drop(cmd_tx);
     let _ = handle.await;
 }
+
+/// End-to-end: while a program owns the alt-screen, devenv copies its output
+/// straight through (option D passthrough) instead of re-rendering it. A cursor
+/// move to a non-first column (`ESC[10;20H`) only survives verbatim if the bytes
+/// were passed through — the VT renderer redraws whole rows from column 1, so it
+/// would never emit that exact sequence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_alt_screen_passthrough_verbatim() {
+    let (io, _stdin_ours, mut stdout_ours) = test_io();
+    let (cmd_tx, cmd_rx) = mpsc::channel(10);
+    let (event_tx, _event_rx) = mpsc::channel(10);
+
+    let session = test_session();
+    let handle = tokio::spawn(async move { session.run(cmd_rx, event_tx, None, io).await });
+
+    // Separate writes (with gaps) so the enter, the alt-screen update, and the
+    // exit land in distinct PTY-output batches: only the middle one runs through
+    // the passthrough path.
+    cmd_tx
+        .send(spawn_cmd(
+            "printf '\\033[?1049h\\033[2J\\033[Hentered'; sleep 0.3; \
+             printf '\\033[10;20HMARKER_ALT'; sleep 0.3; \
+             printf '\\033[?1049lDONE\\n'; exit 0",
+        ))
+        .await
+        .unwrap();
+
+    let collected = read_until(&mut stdout_ours, b"DONE", Duration::from_secs(5));
+    let cursor_move = b"\x1b[10;20H";
+    assert!(
+        collected
+            .windows(cursor_move.len())
+            .any(|w| w == cursor_move),
+        "expected verbatim cursor move from passthrough, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        collected
+            .windows(b"MARKER_ALT".len())
+            .any(|w| w == b"MARKER_ALT"),
+        "expected alt-screen marker in stdout"
+    );
+
+    let _ = handle.await;
+}

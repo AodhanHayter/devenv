@@ -13,10 +13,16 @@
 //! they are picked up automatically. Capture command is in
 //! `benches/fixtures/README.md`.
 //!
+//! The `legacy` (unchanged) side re-renders every frame through the VT; the
+//! optimized side adds per-row dirty tracking and, crucially, alt-screen
+//! passthrough — a batch that starts and stays in the alternate screen is copied
+//! straight through, so a nested full-screen app pays ~zero render cost. The
+//! before/after on the `alt_*` and `fixture:nvim*` corpora is that passthrough.
+//!
 //! Metrics per corpus:
 //! - MiB/s        — input throughput the pipeline sustains
 //! - us/frame     — wall time per rendered batch (the latency a nested app sees)
-//! - amplify      — bytes re-emitted / bytes in (output blow-up)
+//! - amplify      — bytes re-emitted / bytes in (output blow-up; ~1.0 = passthrough)
 //! - cells/frame  — libghostty FFI cell reads per frame (the dominant cost)
 //! - redraw/skip  — rows re-serialized vs rows the diff skipped (still read)
 

@@ -1023,6 +1023,12 @@ impl ShellSession {
         let mut esc = EscapeState::new();
         let mut resize_pending = false;
         let mut esc_events = Vec::new();
+        // Reusable buffers for the alt-screen passthrough path: `fwd_buf` holds
+        // the escapes still owed to the terminal when we exit alt-screen, and
+        // `batch_chunks` holds the raw bytes copied straight through while a
+        // nested app owns the alt-screen.
+        let mut fwd_buf: Vec<u8> = Vec::new();
+        let mut batch_chunks: Vec<Vec<u8>> = Vec::new();
 
         loop {
             // Use select! to handle both events and spinner animation
@@ -1128,55 +1134,125 @@ impl ShellSession {
                     esc.reset_batch();
                     let mut perf_bytes_in = data.len();
                     let mut perf_chunks = 1usize;
+
+                    // While a nested full-screen app owns the alt-screen, copy its
+                    // raw output straight to the terminal instead of re-rendering
+                    // it through the VT (handled after the drain loop). Engaged
+                    // only when the batch *starts* in alt-screen; the enter/exit
+                    // frames still flow through the VT so the primary grid the
+                    // terminal restores on exit stays coherent.
+                    let passthrough = was_in_alt && crate::perf::passthrough();
+
+                    fwd_buf.clear();
+                    batch_chunks.clear();
+                    let mut total_scroll = 0usize;
+
+                    // First chunk: scan escapes — forwarding straight to the
+                    // terminal normally, or into `fwd_buf` while buffering a
+                    // passthrough batch — and feed the VT unless we are passing the
+                    // batch through untouched.
                     let t = crate::perf::enabled().then(Instant::now);
-                    escape_state_process(
-                        &mut scanner,
-                        &data,
-                        &mut esc,
-                        stdout,
-                        &**pty,
-                        self.pty_size(),
-                        &mut esc_events,
-                    )?;
+                    if passthrough {
+                        escape_state_process(
+                            &mut scanner,
+                            &data,
+                            &mut esc,
+                            &mut fwd_buf,
+                            &**pty,
+                            self.pty_size(),
+                            &mut esc_events,
+                        )?;
+                    } else {
+                        escape_state_process(
+                            &mut scanner,
+                            &data,
+                            &mut esc,
+                            stdout,
+                            &**pty,
+                            self.pty_size(),
+                            &mut esc_events,
+                        )?;
+                    }
                     if let Some(t) = t {
                         crate::perf::add_scan(t.elapsed());
                     }
-
-                    // Feed output into VT and track how many lines scrolled off
-                    let text = utf8_acc.accumulate(&data);
-                    let t = crate::perf::enabled().then(Instant::now);
-                    let mut total_scroll = feed_vt(vt, &text);
-                    if let Some(t) = t {
-                        crate::perf::add_vt(t.elapsed());
+                    if passthrough {
+                        batch_chunks.push(data);
+                    } else {
+                        let text = utf8_acc.accumulate(&data);
+                        let t = crate::perf::enabled().then(Instant::now);
+                        total_scroll += feed_vt(vt, &text);
+                        if let Some(t) = t {
+                            crate::perf::add_vt(t.elapsed());
+                        }
                     }
 
-                    // Batch: drain any additional pending PtyOutput events
+                    // Batch: drain any additional pending events.
                     while let Ok(event) = event_rx.try_recv() {
                         match event {
                             Event::PtyOutput(more) => {
                                 perf_bytes_in += more.len();
                                 perf_chunks += 1;
                                 let t = crate::perf::enabled().then(Instant::now);
-                                escape_state_process(
-                                    &mut scanner,
-                                    &more,
-                                    &mut esc,
-                                    stdout,
-                                    &**pty,
-                                    self.pty_size(),
-                                    &mut esc_events,
-                                )?;
+                                if passthrough {
+                                    escape_state_process(
+                                        &mut scanner,
+                                        &more,
+                                        &mut esc,
+                                        &mut fwd_buf,
+                                        &**pty,
+                                        self.pty_size(),
+                                        &mut esc_events,
+                                    )?;
+                                } else {
+                                    escape_state_process(
+                                        &mut scanner,
+                                        &more,
+                                        &mut esc,
+                                        stdout,
+                                        &**pty,
+                                        self.pty_size(),
+                                        &mut esc_events,
+                                    )?;
+                                }
                                 if let Some(t) = t {
                                     crate::perf::add_scan(t.elapsed());
                                 }
-                                let text = utf8_acc.accumulate(&more);
-                                let t = crate::perf::enabled().then(Instant::now);
-                                total_scroll += feed_vt(vt, &text);
-                                if let Some(t) = t {
-                                    crate::perf::add_vt(t.elapsed());
+                                if passthrough {
+                                    batch_chunks.push(more);
+                                } else {
+                                    let text = utf8_acc.accumulate(&more);
+                                    let t = crate::perf::enabled().then(Instant::now);
+                                    total_scroll += feed_vt(vt, &text);
+                                    if let Some(t) = t {
+                                        crate::perf::add_vt(t.elapsed());
+                                    }
                                 }
                             }
                             Event::PtyExit(exit_code) => {
+                                if passthrough && esc.in_alternate_screen {
+                                    // Shell exited mid-passthrough: leave alt-screen
+                                    // and reset modes; the VT grid is frozen/stale,
+                                    // so don't render it. The unflushed buffered
+                                    // bytes are intentionally dropped — the program
+                                    // is gone and we're restoring the primary screen.
+                                    // cleanup resets every tracked mode (resets are
+                                    // idempotent), so the terminal is left clean.
+                                    escape_state_cleanup(&esc, stdout)?;
+                                    stdout.flush()?;
+                                    return Ok(exit_code);
+                                }
+                                if passthrough {
+                                    // Exited alt-screen, then the shell exited in the
+                                    // same batch: forward the tracked escapes and
+                                    // fold the buffered bytes into the VT so the
+                                    // final render is correct.
+                                    stdout.write_all(&fwd_buf)?;
+                                    for chunk in batch_chunks.drain(..) {
+                                        let text = utf8_acc.accumulate(&chunk);
+                                        feed_vt(vt, &text);
+                                    }
+                                }
                                 escape_state_cleanup(&esc, stdout)?;
                                 renderer.render_with_scroll(stdout, vt)?;
                                 return Ok(exit_code);
@@ -1188,12 +1264,61 @@ impl ShellSession {
                                 }
                             }
                             Event::Command(cmd) => {
-                                total_scroll += self.handle_command(cmd, vt)?;
+                                // In passthrough the VT is frozen and unrendered, so
+                                // ignore any scroll the command would have produced.
+                                let scrolled = self.handle_command(cmd, vt)?;
+                                if !passthrough {
+                                    total_scroll += scrolled;
+                                }
                             }
                             Event::Resize => {
                                 resize_pending = true;
                                 break;
                             }
+                        }
+                    }
+
+                    // Pure alt-screen batch: copy the raw bytes through and skip
+                    // the VT render entirely — the nested app drew the terminal
+                    // directly, so there is nothing left for us to re-render.
+                    //
+                    // `batch_chunks` is the program's verbatim output, so every
+                    // byte it emitted — including mode-setting escapes (mouse,
+                    // bracketed paste, kitty keyboard, …) — reaches the terminal
+                    // here. `fwd_buf` holds the renderer's *duplicate* copies of
+                    // the forwarded escapes; it is dropped precisely so those bytes
+                    // aren't emitted twice. The escape-state tracking stays in sync
+                    // with the terminal because both saw the same raw stream.
+                    //
+                    // Assumes at most one alt-screen transition per batch: a batch
+                    // that exits and re-enters within itself (even number of
+                    // toggles in one ~64 KiB PTY read — not something real apps do)
+                    // would leave the frozen VT's saved primary grid out of step
+                    // until the next clean exit reconciles it.
+                    if passthrough && esc.in_alternate_screen {
+                        let t = crate::perf::enabled().then(Instant::now);
+                        for chunk in &batch_chunks {
+                            stdout.write_all(chunk)?;
+                        }
+                        stdout.flush()?;
+                        if let Some(t) = t {
+                            crate::perf::add_render(t.elapsed());
+                        }
+                        crate::perf::record_passthrough();
+                        crate::perf::record_batch(perf_bytes_in, perf_chunks);
+                        continue;
+                    }
+
+                    if passthrough {
+                        // Exited alt-screen during this batch. Forward the escapes
+                        // we tracked (this carries the alt-screen reset, so the
+                        // terminal restores its primary buffer) and fold the
+                        // buffered raw bytes into the VT so its primary grid catches
+                        // up before the authoritative re-render below.
+                        stdout.write_all(&fwd_buf)?;
+                        for chunk in batch_chunks.drain(..) {
+                            let text = utf8_acc.accumulate(&chunk);
+                            total_scroll += feed_vt(vt, &text);
                         }
                     }
 
@@ -1282,15 +1407,21 @@ impl ShellSession {
 
                 Event::Command(cmd) => {
                     self.handle_command(cmd, vt)?;
-                    queue!(stdout, terminal::BeginSynchronizedUpdate)?;
-                    if renderer.row_offset > 0 {
-                        renderer.render(stdout, vt)?;
-                    } else {
-                        renderer.render_with_scroll(stdout, vt)?;
+                    // While a nested app owns the alt-screen the VT is frozen and
+                    // the terminal is drawn directly by that app; re-rendering the
+                    // VT here would paint stale content over it. Skip the draw —
+                    // the status row is suppressed in alt-screen anyway.
+                    if !esc.in_alternate_screen || crate::perf::legacy() {
+                        queue!(stdout, terminal::BeginSynchronizedUpdate)?;
+                        if renderer.row_offset > 0 {
+                            renderer.render(stdout, vt)?;
+                        } else {
+                            renderer.render_with_scroll(stdout, vt)?;
+                        }
+                        self.draw_status_and_cursor(stdout, vt, renderer, esc.in_alternate_screen)?;
+                        queue!(stdout, terminal::EndSynchronizedUpdate)?;
+                        stdout.flush()?;
                     }
-                    self.draw_status_and_cursor(stdout, vt, renderer, esc.in_alternate_screen)?;
-                    queue!(stdout, terminal::EndSynchronizedUpdate)?;
-                    stdout.flush()?;
                 }
 
                 Event::Resize => {
@@ -1325,16 +1456,25 @@ impl ShellSession {
                         if let Err(e) = vt.resize(pty_size.cols, pty_size.rows, 0, 0) {
                             tracing::warn!("failed to resize terminal: {e}");
                         }
-                        renderer.discard_vt_scrollback(vt);
-                        renderer.render_full(stdout, vt)?;
                         // Row geometry changed — force a status redraw even if the
                         // content text is unchanged.
                         self.status_line.mark_dirty();
-                        if self.config.show_status_line && !esc.in_alternate_screen {
-                            self.status_line.draw(stdout, cols, rows)?;
+                        if esc.in_alternate_screen && crate::perf::passthrough() {
+                            // Passthrough: the nested app repaints itself on its
+                            // SIGWINCH (delivered by the PTY resize above), so don't
+                            // paint the frozen VT over it. The VT was resized so the
+                            // primary grid is correct when we exit alt-screen; force
+                            // a full redraw then.
+                            renderer.invalidate();
+                        } else {
+                            renderer.discard_vt_scrollback(vt);
+                            renderer.render_full(stdout, vt)?;
+                            if self.config.show_status_line && !esc.in_alternate_screen {
+                                self.status_line.draw(stdout, cols, rows)?;
+                            }
+                            renderer.write_cursor(stdout, vt)?;
+                            stdout.flush()?;
                         }
-                        renderer.write_cursor(stdout, vt)?;
-                        stdout.flush()?;
                         if let Err(e) = coordinator_tx.try_send(ShellEvent::Resize {
                             cols: pty_size.cols,
                             rows: pty_size.rows,
@@ -1466,7 +1606,7 @@ impl Default for ShellSession {
 /// without the PTY, threads, or channels so the core render cost can be measured
 /// deterministically. Feed inputs must not contain a TextAreaSizeQuery (CSI 18t);
 /// the no-op responder simply drops any reply.
-#[cfg(feature = "bench-internals")]
+#[cfg(any(test, feature = "bench-internals"))]
 pub struct RenderHarness {
     vt: Terminal<'static, 'static>,
     renderer: Renderer,
@@ -1477,19 +1617,20 @@ pub struct RenderHarness {
     esc_events: Vec<crate::escape::SequenceEvent>,
     size: PtySize,
     out: Vec<u8>,
+    fwd_buf: Vec<u8>,
 }
 
-#[cfg(feature = "bench-internals")]
+#[cfg(any(test, feature = "bench-internals"))]
 struct NoResponder;
 
-#[cfg(feature = "bench-internals")]
+#[cfg(any(test, feature = "bench-internals"))]
 impl crate::escape_state::QueryResponder for NoResponder {
     fn respond(&self, _bytes: &[u8]) -> io::Result<()> {
         Ok(())
     }
 }
 
-#[cfg(feature = "bench-internals")]
+#[cfg(any(test, feature = "bench-internals"))]
 impl RenderHarness {
     /// Build a harness for a `cols`x`rows` terminal. `status_line` toggles the
     /// per-batch status-line draw so its cost can be isolated.
@@ -1524,30 +1665,61 @@ impl RenderHarness {
             esc_events: Vec::new(),
             size,
             out: Vec::with_capacity(64 * 1024),
+            fwd_buf: Vec::new(),
         }
     }
 
     /// Push one chunk of inner-program output through the full pipeline,
-    /// appending the re-emitted terminal bytes to the internal sink.
+    /// appending the re-emitted terminal bytes to the internal sink. Mirrors the
+    /// session's per-batch logic, including alt-screen passthrough (a chunk that
+    /// starts and stays in alt-screen is copied straight through, with no VT
+    /// render).
     pub fn feed(&mut self, chunk: &[u8]) {
         let was_in_alt = self.esc.in_alternate_screen;
         self.esc.reset_batch();
-        escape_state_process(
-            &mut self.scanner,
-            chunk,
-            &mut self.esc,
-            &mut self.out,
-            &NoResponder,
-            self.size,
-            &mut self.esc_events,
-        )
-        .expect("scan");
-        let text = self.utf8_acc.accumulate(chunk);
-        feed_vt(&mut self.vt, &text);
+        let passthrough = was_in_alt && crate::perf::passthrough();
 
-        if was_in_alt != self.esc.in_alternate_screen {
+        if passthrough {
+            self.fwd_buf.clear();
+            escape_state_process(
+                &mut self.scanner,
+                chunk,
+                &mut self.esc,
+                &mut self.fwd_buf,
+                &NoResponder,
+                self.size,
+                &mut self.esc_events,
+            )
+            .expect("scan");
+            if self.esc.in_alternate_screen {
+                // Pure alt-screen batch: copy raw, skip the VT render entirely.
+                self.out.extend_from_slice(chunk);
+                crate::perf::record_passthrough();
+                return;
+            }
+            // Exited alt-screen: forward tracked escapes, fold into the VT, render.
+            self.out.extend_from_slice(&self.fwd_buf);
+            let text = self.utf8_acc.accumulate(chunk);
+            feed_vt(&mut self.vt, &text);
             self.renderer.invalidate();
+        } else {
+            escape_state_process(
+                &mut self.scanner,
+                chunk,
+                &mut self.esc,
+                &mut self.out,
+                &NoResponder,
+                self.size,
+                &mut self.esc_events,
+            )
+            .expect("scan");
+            let text = self.utf8_acc.accumulate(chunk);
+            feed_vt(&mut self.vt, &text);
+            if was_in_alt != self.esc.in_alternate_screen {
+                self.renderer.invalidate();
+            }
         }
+
         if self.esc.in_alternate_screen || self.renderer.row_offset > 0 {
             self.renderer
                 .render(&mut self.out, &self.vt)
@@ -1559,12 +1731,12 @@ impl RenderHarness {
         }
         // Mirror the session: the status line is suppressed in alt-screen
         // (legacy mode draws it every frame regardless, for before/after).
-        if let Some(status) = &mut self.status {
-            if crate::perf::legacy() || !self.esc.in_alternate_screen {
-                status
-                    .draw(&mut self.out, self.size.cols, self.size.rows)
-                    .expect("status");
-            }
+        if let Some(status) = &mut self.status
+            && (crate::perf::legacy() || !self.esc.in_alternate_screen)
+        {
+            status
+                .draw(&mut self.out, self.size.cols, self.size.rows)
+                .expect("status");
         }
         self.renderer
             .write_cursor(&mut self.out, &self.vt)
@@ -1572,8 +1744,15 @@ impl RenderHarness {
     }
 
     /// Total bytes re-emitted so far (the numerator of output amplification).
+    #[cfg(feature = "bench-internals")]
     pub fn output_len(&self) -> usize {
         self.out.len()
+    }
+
+    /// Bytes re-emitted so far, for assertions in tests.
+    #[cfg(test)]
+    pub fn output_bytes(&self) -> &[u8] {
+        &self.out
     }
 
     /// Drop accumulated output without resetting VT/renderer state.
@@ -1586,6 +1765,115 @@ impl RenderHarness {
 mod tests {
     use super::*;
     use portable_pty::CommandBuilder;
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Alt-screen passthrough: once a nested app owns the alt-screen, its updates
+    /// are copied to the terminal verbatim instead of being re-rendered through
+    /// the VT. This is the core of "option D" — the nested program effectively
+    /// talks to the terminal directly.
+    #[test]
+    fn passthrough_copies_raw_in_alt_screen() {
+        crate::perf::set_legacy(false);
+        crate::perf::set_passthrough(true);
+        let mut h = RenderHarness::new(80, 24, false);
+        // Enter alt-screen with an initial paint — this frame still flows through
+        // the VT so the primary grid stays coherent for the eventual exit.
+        h.feed(b"\x1b[?1049h\x1b[2J\x1b[Hhello");
+        h.reset_output();
+        // Steady-state alt-screen update: copied through byte-for-byte.
+        let update = b"\x1b[5;3Hworld";
+        h.feed(update);
+        assert_eq!(
+            h.output_bytes(),
+            update,
+            "alt-screen update should pass through raw"
+        );
+    }
+
+    /// A mode-setting escape (here mouse tracking) emitted mid alt-screen must
+    /// still reach the terminal — it rides through inside the raw copy. The
+    /// renderer also tracks it in a forwarded-escape buffer, but that buffer is a
+    /// redundant duplicate dropped on the pure-alt path; the raw passthrough is
+    /// the single source of truth, so the terminal never diverges from the
+    /// tracked mode state.
+    #[test]
+    fn passthrough_carries_mode_escapes_verbatim() {
+        crate::perf::set_legacy(false);
+        crate::perf::set_passthrough(true);
+        let mut h = RenderHarness::new(80, 24, false);
+        h.feed(b"\x1b[?1049h\x1b[2J\x1b[Hhi");
+        h.reset_output();
+        let update = b"\x1b[?1000h\x1b[5;3Hx";
+        h.feed(update);
+        assert_eq!(
+            h.output_bytes(),
+            update,
+            "mode escape + content must pass through verbatim (no duplication, no loss)"
+        );
+    }
+
+    /// With passthrough disabled the same alt-screen update is re-rendered through
+    /// the VT (absolute MoveTo per row, ResetColor, …), so the emitted bytes are
+    /// not a verbatim copy of the input.
+    #[test]
+    fn passthrough_disabled_re_renders() {
+        crate::perf::set_legacy(false);
+        crate::perf::set_passthrough(false);
+        let mut h = RenderHarness::new(80, 24, false);
+        h.feed(b"\x1b[?1049h\x1b[2J\x1b[Hhello");
+        h.reset_output();
+        let update = b"\x1b[5;3Hworld";
+        h.feed(update);
+        assert_ne!(h.output_bytes(), update);
+        assert!(!h.output_bytes().is_empty());
+        crate::perf::set_passthrough(true);
+    }
+
+    /// Legacy mode forces the pre-optimization full re-render, so passthrough is
+    /// off even though the flag is on.
+    #[test]
+    fn legacy_disables_passthrough() {
+        crate::perf::set_passthrough(true);
+        crate::perf::set_legacy(true);
+        let mut h = RenderHarness::new(80, 24, false);
+        h.feed(b"\x1b[?1049h\x1b[2J\x1b[Hhello");
+        h.reset_output();
+        let update = b"\x1b[5;3Hworld";
+        h.feed(update);
+        assert_ne!(
+            h.output_bytes(),
+            update,
+            "legacy mode should re-render, not pass through"
+        );
+        crate::perf::set_legacy(false);
+    }
+
+    /// Exiting the alt-screen out of a passthrough run reconciles the terminal to
+    /// the VT's primary grid: the alt-screen reset is forwarded and the
+    /// primary-screen content is rendered (not copied raw).
+    #[test]
+    fn passthrough_exit_reconciles_to_primary() {
+        crate::perf::set_legacy(false);
+        crate::perf::set_passthrough(true);
+        let mut h = RenderHarness::new(80, 24, false);
+        h.feed(b"\x1b[?1049h\x1b[2J\x1b[Halt-content");
+        h.feed(b"\x1b[3;3Hmore-alt"); // steady-state passthrough
+        h.reset_output();
+        // Exit alt-screen and print a primary-screen prompt.
+        h.feed(b"\x1b[?1049l\r\n$ ready");
+        let out = h.output_bytes();
+        assert!(
+            contains(out, b"\x1b[?1049l"),
+            "alt-screen reset should be forwarded on exit"
+        );
+        assert!(
+            contains(out, b"ready"),
+            "primary prompt should be re-rendered after exit"
+        );
+    }
 
     /// Nails the libghostty dirty-tracking protocol the renderer depends on:
     /// reading per-row grid dirty then consuming it via RenderState::update so
