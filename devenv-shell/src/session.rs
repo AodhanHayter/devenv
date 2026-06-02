@@ -319,6 +319,11 @@ impl Renderer {
     /// state via `RenderState::update` so the next frame sees only newly-changed
     /// rows. Returns, per row in `0..limit`, whether it changed since last call.
     fn collect_dirty(&mut self, vt: &Terminal<'static, 'static>, limit: usize) -> Vec<bool> {
+        // Legacy mode: every row dirty, no render-state update — reproduces the
+        // pre-optimization full-screen readback for before/after benchmarking.
+        if crate::perf::legacy() {
+            return vec![true; limit];
+        }
         let dirty: Vec<bool> = (0..limit)
             .map(|row_idx| {
                 vt.grid_ref(active_point(row_idx as u32))
@@ -1532,9 +1537,10 @@ impl RenderHarness {
                 .render_with_scroll(&mut self.out, &mut self.vt)
                 .expect("render");
         }
-        // Mirror the session: the status line is suppressed in alt-screen.
+        // Mirror the session: the status line is suppressed in alt-screen
+        // (legacy mode draws it every frame regardless, for before/after).
         if let Some(status) = &mut self.status {
-            if !self.esc.in_alternate_screen {
+            if crate::perf::legacy() || !self.esc.in_alternate_screen {
                 status
                     .draw(&mut self.out, self.size.cols, self.size.rows)
                     .expect("status");

@@ -238,7 +238,11 @@ struct Result {
     status: bool,
 }
 
-fn bench(c: &Corpus) -> Result {
+/// `legacy` reverts the renderer to its pre-optimization behavior so the same
+/// binary measures unchanged-vs-optimized on identical input.
+fn bench(c: &Corpus, legacy: bool) -> Result {
+    perf::set_legacy(legacy);
+
     // Structural pass with perf on: counts FFI cell reads + row diff outcomes.
     perf::set_enabled(true);
     perf::reset();
@@ -263,6 +267,8 @@ fn bench(c: &Corpus) -> Result {
         best = best.min(t.elapsed());
     }
 
+    perf::set_legacy(false);
+
     Result {
         name: c.name.clone(),
         frames: c.frames.len(),
@@ -278,35 +284,38 @@ fn main() {
     let mut corpora = synthetic_corpora();
     corpora.extend(fixture_corpora());
 
-    println!(
-        "\n{COLS}x{ROWS} terminal · {TIMING_PASSES} timing passes · best-of\n\
-         {:<28} {:>6} {:>9} {:>9} {:>9} {:>8} {:>9} {:>11}",
-        "corpus", "frames", "MiB/s", "us/frame", "amplify", "status", "cells/fr", "redraw/skip",
-    );
-    println!("{}", "─".repeat(104));
-
-    for c in &corpora {
-        let r = bench(c);
-        let secs = r.best.as_secs_f64();
-        let mibs = (r.bytes_in as f64) / secs / 1024.0 / 1024.0;
-        let us_per_frame = r.best.as_micros() as f64 / r.frames.max(1) as f64;
-        let amplify = if r.bytes_in > 0 {
+    let us = |r: &Result| r.best.as_micros() as f64 / r.frames.max(1) as f64;
+    let cells = |r: &Result| r.snap.cell_reads as f64 / r.frames.max(1) as f64;
+    let amp = |r: &Result| {
+        if r.bytes_in > 0 {
             r.out_len as f64 / r.bytes_in as f64
         } else {
             0.0
-        };
-        let cells_per_frame = r.snap.cell_reads as f64 / r.frames.max(1) as f64;
+        }
+    };
+
+    println!(
+        "\n{COLS}x{ROWS} terminal · {TIMING_PASSES} timing passes · best-of · legacy(unchanged) vs optimized\n\
+         {:<24} {:>4} {:>17} {:>8} {:>15} {:>15}",
+        "corpus", "stat", "us/frame old→new", "speedup", "cells/fr o→n", "amplify o→n",
+    );
+    println!("{}", "─".repeat(92));
+
+    for c in &corpora {
+        let old = bench(c, true);
+        let new = bench(c, false);
+        let speedup = us(&old) / us(&new).max(1e-9);
         println!(
-            "{:<28} {:>6} {:>9.1} {:>9.1} {:>8.1}x {:>8} {:>9.0} {:>5}/{:<5}",
-            r.name,
-            r.frames,
-            mibs,
-            us_per_frame,
-            amplify,
-            if r.status { "on" } else { "off" },
-            cells_per_frame,
-            r.snap.rows_redrawn,
-            r.snap.rows_skipped,
+            "{:<24} {:>4} {:>7.1}→{:<7.1} {:>6.1}x {:>6.0}→{:<6.0} {:>5.1}x→{:.1}x",
+            new.name,
+            if new.status { "on" } else { "off" },
+            us(&old),
+            us(&new),
+            speedup,
+            cells(&old),
+            cells(&new),
+            amp(&old),
+            amp(&new),
         );
     }
     println!();

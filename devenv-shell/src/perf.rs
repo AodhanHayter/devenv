@@ -18,6 +18,13 @@ use std::time::Duration;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// When set, the renderer reverts to its pre-optimization behavior: read back
+/// every row each frame (no dirty-tracking skip), and draw the status line every
+/// frame including in alt-screen (no skip-if-unchanged, no suppression). Lets the
+/// benchmark produce a true before/after on identical inputs in one binary.
+/// Also settable at runtime via `DEVENV_SHELL_LEGACY_RENDER`.
+static LEGACY: AtomicBool = AtomicBool::new(false);
+
 struct Counters {
     /// `PtyOutput` batches processed (one render per batch).
     frames: AtomicU64,
@@ -72,12 +79,17 @@ static C: Counters = Counters {
     session_ns: AtomicU64::new(0),
 };
 
-/// Read `DEVENV_SHELL_PERF` and arm the counters if it is set to a truthy value.
-pub fn init_from_env() {
-    let on = std::env::var("DEVENV_SHELL_PERF")
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
         .map(|v| !v.is_empty() && v != "0" && v != "false")
-        .unwrap_or(false);
-    ENABLED.store(on, Relaxed);
+        .unwrap_or(false)
+}
+
+/// Read `DEVENV_SHELL_PERF` / `DEVENV_SHELL_LEGACY_RENDER` and arm the
+/// corresponding flags if set to a truthy value.
+pub fn init_from_env() {
+    ENABLED.store(env_truthy("DEVENV_SHELL_PERF"), Relaxed);
+    LEGACY.store(env_truthy("DEVENV_SHELL_LEGACY_RENDER"), Relaxed);
 }
 
 /// Force the profiler on/off (used by tests and benches).
@@ -88,6 +100,16 @@ pub fn set_enabled(on: bool) {
 #[inline]
 pub fn enabled() -> bool {
     ENABLED.load(Relaxed)
+}
+
+/// Force pre-optimization rendering on/off (benches drive this for before/after).
+pub fn set_legacy(on: bool) {
+    LEGACY.store(on, Relaxed);
+}
+
+#[inline]
+pub fn legacy() -> bool {
+    LEGACY.load(Relaxed)
 }
 
 /// Structural per-run counters, read by benches to report the work done

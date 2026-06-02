@@ -414,7 +414,8 @@ impl StatusLine {
 
         // Skip the redraw when the content is byte-identical to last time — the
         // status row was protected by render's scroll region and still shows it.
-        if self.last_drawn.as_deref() == Some(content.as_slice()) {
+        // Legacy mode forces the redraw (pre-optimization before/after baseline).
+        if !crate::perf::legacy() && self.last_drawn.as_deref() == Some(content.as_slice()) {
             return Ok(false);
         }
 
