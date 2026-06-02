@@ -25,12 +25,20 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const COLS: u16 = 80;
-const ROWS: u16 = 24;
+/// Default terminal geometry; override with `DEVENV_BENCH_COLS`/`DEVENV_BENCH_ROWS`.
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
 /// PTY read buffer size — raw fixtures are chunked at this size to mirror how
 /// the real reader delivers bytes (one chunk ≈ one un-coalesced render).
 const PTY_CHUNK: usize = 4096;
 const TIMING_PASSES: usize = 12;
+
+fn env_u16(name: &str, default: u16) -> u16 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
 
 struct Corpus {
     name: String,
@@ -144,7 +152,7 @@ fn gen_cjk_wide(cols: u16, rows: u16, frames: usize) -> Vec<Vec<u8>> {
             write!(b, "\x1b[{};1H", r + 1).unwrap();
             // wide glyphs take 2 columns each
             for c in 0..(cols / 2) {
-                let g = GLYPHS[((c as usize + r as usize + fi) % GLYPHS.len())];
+                let g = GLYPHS[(c as usize + r as usize + fi) % GLYPHS.len()];
                 b.extend_from_slice(g.as_bytes());
             }
         }
@@ -153,11 +161,11 @@ fn gen_cjk_wide(cols: u16, rows: u16, frames: usize) -> Vec<Vec<u8>> {
     out
 }
 
-fn synthetic_corpora() -> Vec<Corpus> {
+fn synthetic_corpora(cols: u16, rows: u16) -> Vec<Corpus> {
     let mk = |name: &str, status: bool, frames: Vec<Vec<u8>>| Corpus {
         name: name.to_string(),
-        cols: COLS,
-        rows: ROWS,
+        cols,
+        rows,
         status_line: status,
         frames,
     };
@@ -165,32 +173,34 @@ fn synthetic_corpora() -> Vec<Corpus> {
         mk(
             "alt_full_repaint",
             false,
-            gen_alt_full_repaint(COLS, ROWS, 200),
+            gen_alt_full_repaint(cols, rows, 200),
         ),
         mk(
             "alt_full_repaint+status",
             true,
-            gen_alt_full_repaint(COLS, ROWS, 200),
+            gen_alt_full_repaint(cols, rows, 200),
         ),
         mk(
             "alt_single_cell",
             false,
-            gen_alt_single_cell(COLS, ROWS, 400),
+            gen_alt_single_cell(cols, rows, 400),
         ),
         mk(
             "alt_single_cell+status",
             true,
-            gen_alt_single_cell(COLS, ROWS, 400),
+            gen_alt_single_cell(cols, rows, 400),
         ),
-        mk("scroll_flood+status", true, gen_scroll_flood(COLS, 600)),
-        mk("heavy_sgr", false, gen_heavy_sgr(COLS, ROWS, 150)),
-        mk("cjk_wide", false, gen_cjk_wide(COLS, ROWS, 150)),
+        mk("scroll_flood+status", true, gen_scroll_flood(cols, 600)),
+        mk("heavy_sgr", false, gen_heavy_sgr(cols, rows, 150)),
+        mk("cjk_wide", false, gen_cjk_wide(cols, rows, 150)),
     ]
 }
 
 /// Load `benches/fixtures/*.bin` raw PTY captures, chunked at PTY_CHUNK to mirror
-/// the reader. Each fixture runs with status line off and on.
-fn fixture_corpora() -> Vec<Corpus> {
+/// the reader. A capture's escape stream assumes the geometry it was recorded
+/// at, so a fixture is only included when the run geometry matches: name files
+/// `<name>.<cols>x<rows>.bin` (untagged files are accepted at any size).
+fn fixture_corpora(cols: u16, rows: u16) -> Vec<Corpus> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/fixtures");
     let mut corpora = Vec::new();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -214,12 +224,20 @@ fn fixture_corpora() -> Vec<Corpus> {
             .and_then(|s| s.to_str())
             .unwrap_or("fixture")
             .to_string();
+        // Skip fixtures tagged with a geometry that doesn't match this run.
+        if let Some((_, geo)) = stem.rsplit_once('.')
+            && let Some((c, r)) = geo.split_once('x')
+            && let (Ok(fc), Ok(fr)) = (c.parse::<u16>(), r.parse::<u16>())
+            && (fc != cols || fr != rows)
+        {
+            continue;
+        }
         let frames: Vec<Vec<u8>> = bytes.chunks(PTY_CHUNK).map(|c| c.to_vec()).collect();
         for status in [false, true] {
             corpora.push(Corpus {
                 name: format!("fixture:{stem}{}", if status { "+status" } else { "" }),
-                cols: COLS,
-                rows: ROWS,
+                cols,
+                rows,
                 status_line: status,
                 frames: frames.clone(),
             });
@@ -281,8 +299,10 @@ fn bench(c: &Corpus, legacy: bool) -> Result {
 }
 
 fn main() {
-    let mut corpora = synthetic_corpora();
-    corpora.extend(fixture_corpora());
+    let cols = env_u16("DEVENV_BENCH_COLS", DEFAULT_COLS);
+    let rows = env_u16("DEVENV_BENCH_ROWS", DEFAULT_ROWS);
+    let mut corpora = synthetic_corpora(cols, rows);
+    corpora.extend(fixture_corpora(cols, rows));
 
     let us = |r: &Result| r.best.as_micros() as f64 / r.frames.max(1) as f64;
     let cells = |r: &Result| r.snap.cell_reads as f64 / r.frames.max(1) as f64;
@@ -295,7 +315,7 @@ fn main() {
     };
 
     println!(
-        "\n{COLS}x{ROWS} terminal · {TIMING_PASSES} timing passes · best-of · legacy(unchanged) vs optimized\n\
+        "\n{cols}x{rows} terminal · {TIMING_PASSES} timing passes · best-of · legacy(unchanged) vs optimized\n\
          {:<24} {:>4} {:>17} {:>8} {:>15} {:>15}",
         "corpus", "stat", "us/frame old→new", "speedup", "cells/fr o→n", "amplify o→n",
     );
