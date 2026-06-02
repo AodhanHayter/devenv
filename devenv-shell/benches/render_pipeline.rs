@@ -1,0 +1,313 @@
+//! Dependency-free render-pipeline benchmark.
+//!
+//! `devenv shell` mediates every PTY-output batch through a VT emulator and
+//! re-renders the visible screen (tmux-style), which is what makes nested
+//! full-screen TUIs (nvim, claude-code) feel laggy. This benchmark drives fixed
+//! byte streams through that exact pipeline (escape scan → vt_write → render →
+//! status) via [`devenv_shell::RenderHarness`], with no PTY, threads, or real
+//! terminal, so the core render cost is measured deterministically.
+//!
+//! Run: `cargo bench -p devenv-shell --features bench-internals`
+//!
+//! Real fixtures: drop raw PTY-master captures as `benches/fixtures/*.bin` and
+//! they are picked up automatically. Capture command is in
+//! `benches/fixtures/README.md`.
+//!
+//! Metrics per corpus:
+//! - MiB/s        — input throughput the pipeline sustains
+//! - us/frame     — wall time per rendered batch (the latency a nested app sees)
+//! - amplify      — bytes re-emitted / bytes in (output blow-up)
+//! - cells/frame  — libghostty FFI cell reads per frame (the dominant cost)
+//! - redraw/skip  — rows re-serialized vs rows the diff skipped (still read)
+
+use devenv_shell::{RenderHarness, perf};
+use std::io::Write as _;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+const COLS: u16 = 80;
+const ROWS: u16 = 24;
+/// PTY read buffer size — raw fixtures are chunked at this size to mirror how
+/// the real reader delivers bytes (one chunk ≈ one un-coalesced render).
+const PTY_CHUNK: usize = 4096;
+const TIMING_PASSES: usize = 12;
+
+struct Corpus {
+    name: String,
+    cols: u16,
+    rows: u16,
+    status_line: bool,
+    /// Each entry is one logical update the inner program emits → one render.
+    frames: Vec<Vec<u8>>,
+}
+
+impl Corpus {
+    fn bytes_in(&self) -> usize {
+        self.frames.iter().map(|f| f.len()).sum()
+    }
+}
+
+/// A full-screen repaint every frame: every row moved-to, recolored, rewritten
+/// with content that changes each frame. Models nvim/claude-code scrolling or
+/// redrawing the whole viewport — the throughput-ceiling case.
+fn gen_alt_full_repaint(cols: u16, rows: u16, frames: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(frames);
+    for fi in 0..frames {
+        let mut b = Vec::new();
+        if fi == 0 {
+            b.extend_from_slice(b"\x1b[?1049h"); // enter alternate screen
+        }
+        b.extend_from_slice(b"\x1b[H");
+        for r in 0..rows {
+            let color = 16 + ((r as u32 + fi as u32) % 200);
+            write!(b, "\x1b[{};1H\x1b[38;5;{color}m", r + 1).unwrap();
+            for c in 0..cols {
+                let ch = b'!' + (((c as u32 + r as u32 + fi as u32) % 90) as u8);
+                b.push(ch);
+            }
+        }
+        b.extend_from_slice(b"\x1b[0m");
+        out.push(b);
+    }
+    out
+}
+
+/// One full repaint, then frames that change a single cell each (cursor move +
+/// one char). Models typing in nvim — exposes the cost of reading the whole
+/// screen just to diff a one-cell change.
+fn gen_alt_single_cell(cols: u16, rows: u16, frames: usize) -> Vec<Vec<u8>> {
+    let mut out = gen_alt_full_repaint(cols, rows, 1);
+    for fi in 1..frames {
+        let mut b = Vec::new();
+        let r = (fi as u16) % rows + 1;
+        let c = (fi as u16 * 7) % cols + 1;
+        let ch = b'a' + ((fi % 26) as u8);
+        write!(b, "\x1b[{r};{c}H").unwrap();
+        b.push(ch);
+        out.push(b);
+    }
+    out
+}
+
+/// Plain scrolling output (no alt screen) — exercises render_with_scroll and the
+/// scrollback flush path. Models `cat` / build logs under the status line.
+fn gen_scroll_flood(cols: u16, lines: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(lines);
+    for i in 0..lines {
+        let mut b = Vec::new();
+        let prefix = format!("line {i:>6}: ");
+        b.extend_from_slice(prefix.as_bytes());
+        let fill = (cols as usize).saturating_sub(prefix.len());
+        for c in 0..fill {
+            b.push(b'.' + ((c % 10) as u8));
+        }
+        b.extend_from_slice(b"\r\n");
+        out.push(b);
+    }
+    out
+}
+
+/// Per-character SGR color changes — stresses the escape scanner and the SGR
+/// re-serialization in dump_row.
+fn gen_heavy_sgr(cols: u16, rows: u16, frames: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(frames);
+    for fi in 0..frames {
+        let mut b = Vec::new();
+        if fi == 0 {
+            b.extend_from_slice(b"\x1b[?1049h");
+        }
+        b.extend_from_slice(b"\x1b[H");
+        for r in 0..rows {
+            write!(b, "\x1b[{};1H", r + 1).unwrap();
+            for c in 0..cols {
+                let color = 16 + ((c as u32 + fi as u32) % 216);
+                write!(b, "\x1b[38;5;{color}m#").unwrap();
+            }
+        }
+        b.extend_from_slice(b"\x1b[0m");
+        out.push(b);
+    }
+    out
+}
+
+/// CJK / wide-character grid — exercises the grapheme/wide-cell readback path.
+fn gen_cjk_wide(cols: u16, rows: u16, frames: usize) -> Vec<Vec<u8>> {
+    const GLYPHS: [&str; 6] = ["日", "本", "語", "你", "好", "世"];
+    let mut out = Vec::with_capacity(frames);
+    for fi in 0..frames {
+        let mut b = Vec::new();
+        if fi == 0 {
+            b.extend_from_slice(b"\x1b[?1049h");
+        }
+        b.extend_from_slice(b"\x1b[H");
+        for r in 0..rows {
+            write!(b, "\x1b[{};1H", r + 1).unwrap();
+            // wide glyphs take 2 columns each
+            for c in 0..(cols / 2) {
+                let g = GLYPHS[((c as usize + r as usize + fi) % GLYPHS.len())];
+                b.extend_from_slice(g.as_bytes());
+            }
+        }
+        out.push(b);
+    }
+    out
+}
+
+fn synthetic_corpora() -> Vec<Corpus> {
+    let mk = |name: &str, status: bool, frames: Vec<Vec<u8>>| Corpus {
+        name: name.to_string(),
+        cols: COLS,
+        rows: ROWS,
+        status_line: status,
+        frames,
+    };
+    vec![
+        mk(
+            "alt_full_repaint",
+            false,
+            gen_alt_full_repaint(COLS, ROWS, 200),
+        ),
+        mk(
+            "alt_full_repaint+status",
+            true,
+            gen_alt_full_repaint(COLS, ROWS, 200),
+        ),
+        mk(
+            "alt_single_cell",
+            false,
+            gen_alt_single_cell(COLS, ROWS, 400),
+        ),
+        mk(
+            "alt_single_cell+status",
+            true,
+            gen_alt_single_cell(COLS, ROWS, 400),
+        ),
+        mk("scroll_flood+status", true, gen_scroll_flood(COLS, 600)),
+        mk("heavy_sgr", false, gen_heavy_sgr(COLS, ROWS, 150)),
+        mk("cjk_wide", false, gen_cjk_wide(COLS, ROWS, 150)),
+    ]
+}
+
+/// Load `benches/fixtures/*.bin` raw PTY captures, chunked at PTY_CHUNK to mirror
+/// the reader. Each fixture runs with status line off and on.
+fn fixture_corpora() -> Vec<Corpus> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/fixtures");
+    let mut corpora = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return corpora;
+    };
+    let mut paths: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("bin"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("fixture")
+            .to_string();
+        let frames: Vec<Vec<u8>> = bytes.chunks(PTY_CHUNK).map(|c| c.to_vec()).collect();
+        for status in [false, true] {
+            corpora.push(Corpus {
+                name: format!("fixture:{stem}{}", if status { "+status" } else { "" }),
+                cols: COLS,
+                rows: ROWS,
+                status_line: status,
+                frames: frames.clone(),
+            });
+        }
+    }
+    corpora
+}
+
+struct Result {
+    name: String,
+    frames: usize,
+    bytes_in: usize,
+    best: Duration,
+    out_len: usize,
+    snap: perf::Snapshot,
+    status: bool,
+}
+
+fn bench(c: &Corpus) -> Result {
+    // Structural pass with perf on: counts FFI cell reads + row diff outcomes.
+    perf::set_enabled(true);
+    perf::reset();
+    let mut h = RenderHarness::new(c.cols, c.rows, c.status_line);
+    for f in &c.frames {
+        h.feed(f);
+    }
+    let snap = perf::snapshot();
+    let out_len = h.output_len();
+    perf::set_enabled(false);
+
+    // Timing passes with perf off: fresh harness each pass (VT state mutates),
+    // take the best (least-noise) wall time.
+    let mut best = Duration::MAX;
+    for _ in 0..TIMING_PASSES {
+        let mut h = RenderHarness::new(c.cols, c.rows, c.status_line);
+        let t = Instant::now();
+        for f in &c.frames {
+            h.feed(f);
+        }
+        std::hint::black_box(h.output_len());
+        best = best.min(t.elapsed());
+    }
+
+    Result {
+        name: c.name.clone(),
+        frames: c.frames.len(),
+        bytes_in: c.bytes_in(),
+        best,
+        out_len,
+        snap,
+        status: c.status_line,
+    }
+}
+
+fn main() {
+    let mut corpora = synthetic_corpora();
+    corpora.extend(fixture_corpora());
+
+    println!(
+        "\n{COLS}x{ROWS} terminal · {TIMING_PASSES} timing passes · best-of\n\
+         {:<28} {:>6} {:>9} {:>9} {:>9} {:>8} {:>9} {:>11}",
+        "corpus", "frames", "MiB/s", "us/frame", "amplify", "status", "cells/fr", "redraw/skip",
+    );
+    println!("{}", "─".repeat(104));
+
+    for c in &corpora {
+        let r = bench(c);
+        let secs = r.best.as_secs_f64();
+        let mibs = (r.bytes_in as f64) / secs / 1024.0 / 1024.0;
+        let us_per_frame = r.best.as_micros() as f64 / r.frames.max(1) as f64;
+        let amplify = if r.bytes_in > 0 {
+            r.out_len as f64 / r.bytes_in as f64
+        } else {
+            0.0
+        };
+        let cells_per_frame = r.snap.cell_reads as f64 / r.frames.max(1) as f64;
+        println!(
+            "{:<28} {:>6} {:>9.1} {:>9.1} {:>8.1}x {:>8} {:>9.0} {:>5}/{:<5}",
+            r.name,
+            r.frames,
+            mibs,
+            us_per_frame,
+            amplify,
+            if r.status { "on" } else { "off" },
+            cells_per_frame,
+            r.snap.rows_redrawn,
+            r.snap.rows_skipped,
+        );
+    }
+    println!();
+}

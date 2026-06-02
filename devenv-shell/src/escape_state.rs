@@ -16,6 +16,21 @@ use portable_pty::PtySize;
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 
+/// Sink for replies devenv must write back to the inner program — currently the
+/// TextAreaSizeQuery (CSI 18t) response. Implemented by [`Pty`]; benches and
+/// tests that never feed CSI 18t can pass a no-op so the pipeline runs without a
+/// real PTY.
+pub trait QueryResponder {
+    fn respond(&self, bytes: &[u8]) -> io::Result<()>;
+}
+
+impl QueryResponder for Pty {
+    fn respond(&self, bytes: &[u8]) -> io::Result<()> {
+        self.write_all(bytes)?;
+        self.flush()
+    }
+}
+
 /// Escape-sequence state tracked across PTY output processing.
 ///
 /// Persistent fields (`in_alternate_screen`, `forwarded_dec_modes`,
@@ -135,7 +150,7 @@ pub fn process_escape_events(
     data: &[u8],
     esc: &mut EscapeState,
     stdout: &mut impl Write,
-    pty: &Pty,
+    responder: &dyn QueryResponder,
     pty_size: PtySize,
     events_buf: &mut Vec<SequenceEvent>,
 ) -> io::Result<()> {
@@ -182,8 +197,7 @@ pub fn process_escape_events(
                 };
                 let mut buf = String::new();
                 cmd.write_ansi(&mut buf).unwrap();
-                pty.write_all(buf.as_bytes())?;
-                pty.flush()?;
+                responder.respond(buf.as_bytes())?;
             }
             SequenceEvent::KeypadMode { application } => {
                 queue!(stdout, SetKeypadMode { application })?;

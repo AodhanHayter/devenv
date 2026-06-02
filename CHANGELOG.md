@@ -32,6 +32,7 @@
 - Added `devenv down` as a shorthand for `devenv processes down`, mirroring `devenv up` ([#2862](https://github.com/cachix/devenv/issues/2862)).
 - Bumped secretspec to 0.11, which adds a `[providers]` alias map in `secretspec.toml` and support for a key prefix in the AWS Secrets Manager provider.
 - Added a `--include-envrc` flag to `devenv init` (also settable via `DEVENV_INCLUDE_ENVRC`) to scaffold a direnv `.envrc` file. By default `devenv init` no longer creates an `.envrc` ([#2859](https://github.com/cachix/devenv/pull/2859)).
+- `devenv shell` now renders much faster when a full-screen terminal program (Neovim, an editor, another TUI) runs inside it. The shell only redraws the rows that actually changed instead of the whole screen on every update, and hides its status line while a full-screen app is active so it no longer competes for the bottom row — removing the rendering lag nested programs previously suffered.
 
 ### Breaking Changes
 

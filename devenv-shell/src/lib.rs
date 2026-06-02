@@ -6,6 +6,7 @@
 pub mod dialect;
 pub mod escape;
 pub mod escape_state;
+pub mod perf;
 mod protocol;
 mod pty;
 mod session;
@@ -37,6 +38,10 @@ pub use status_line::{
 
 // Main session
 pub use session::{SessionConfig, SessionError, SessionIo, ShellSession, TuiHandoff};
+
+// PTY-free render-pipeline driver for benches.
+#[cfg(feature = "bench-internals")]
+pub use session::RenderHarness;
 
 // Re-export for convenience
 pub use portable_pty::{CommandBuilder, PtySize};

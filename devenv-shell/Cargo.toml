@@ -47,6 +47,15 @@ default = []
 deterministic-tui = []
 test-all = ["test-pty", "deterministic-tui"]
 test-pty = []
+# Exposes RenderHarness for the dependency-free render-pipeline benchmark.
+bench-internals = []
+
+# Dependency-free render-pipeline benchmark (custom harness, run with
+# `cargo bench -p devenv-shell --features bench-internals`).
+[[bench]]
+name = "render_pipeline"
+harness = false
+required-features = ["bench-internals"]
 
 [package.metadata.cargo-machete]
 ignored = ["libghostty-vt-sys"]
