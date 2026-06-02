@@ -758,8 +758,14 @@ impl ShellSession {
         // 256 KiB capacity so a full-screen repaint with dense SGR doesn't
         // overflow the default 8 KiB buffer and auto-flush mid-frame (extra
         // blocking write() syscalls that also split the synchronized update).
+        // Legacy mode uses the old small buffer for a faithful before/after.
+        let stdout_cap = if crate::perf::legacy() {
+            8 * 1024
+        } else {
+            256 * 1024
+        };
         let mut stdout: Box<dyn Write + Send> = Box::new(io::BufWriter::with_capacity(
-            256 * 1024,
+            stdout_cap,
             crate::perf::CountingWriter::new(stdout_raw),
         ));
         let stdin_source: Box<dyn Read + Send> = io.stdin.unwrap_or_else(|| Box::new(io::stdin()));
@@ -873,7 +879,13 @@ impl ShellSession {
                 // delivered in one read instead of fragmenting into many
                 // syscalls, allocations, channel sends, and scan/accumulate
                 // passes. Heap-allocated to keep the thread stack small.
-                let mut buf = vec![0u8; 64 * 1024];
+                // Legacy mode uses the old 4 KiB buffer for a faithful A/B.
+                let buf_len = if crate::perf::legacy() {
+                    4096
+                } else {
+                    64 * 1024
+                };
+                let mut buf = vec![0u8; buf_len];
                 loop {
                     match pty_reader.read(&mut buf) {
                         Ok(0) => {
@@ -1021,7 +1033,9 @@ impl ShellSession {
                 match event_rx.recv_timeout(spinner_interval) {
                     Ok(event) => Some(event),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if self.config.show_status_line && !esc.in_alternate_screen {
+                        if self.config.show_status_line
+                            && (crate::perf::legacy() || !esc.in_alternate_screen)
+                        {
                             queue!(stdout, terminal::BeginSynchronizedUpdate)?;
                             self.status_line
                                 .draw(stdout, self.size.cols, self.size.rows)?;
@@ -1038,7 +1052,9 @@ impl ShellSession {
                     Ok(event) => Some(event),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         self.status_line.state_mut().clear_reloaded();
-                        if self.config.show_status_line && !esc.in_alternate_screen {
+                        if self.config.show_status_line
+                            && (crate::perf::legacy() || !esc.in_alternate_screen)
+                        {
                             queue!(stdout, terminal::BeginSynchronizedUpdate)?;
                             self.status_line
                                 .draw(stdout, self.size.cols, self.size.rows)?;
@@ -1235,8 +1251,11 @@ impl ShellSession {
 
                     // Suppress the status line while a nested app owns the
                     // alt-screen — it would fight the TUI for the bottom row and
-                    // cost an iocraft layout + redraw every frame.
-                    if self.config.show_status_line && !esc.in_alternate_screen {
+                    // cost an iocraft layout + redraw every frame. (Legacy mode
+                    // keeps drawing it for a faithful before/after.)
+                    if self.config.show_status_line
+                        && (crate::perf::legacy() || !esc.in_alternate_screen)
+                    {
                         let t = crate::perf::enabled().then(Instant::now);
                         let drew = self
                             .status_line
@@ -1406,7 +1425,8 @@ impl ShellSession {
         in_alternate_screen: bool,
     ) -> Result<(), SessionError> {
         // Suppressed in alt-screen; render already positioned the cursor there.
-        if self.config.show_status_line && !in_alternate_screen {
+        // (Legacy mode keeps drawing it for a faithful before/after.)
+        if self.config.show_status_line && (crate::perf::legacy() || !in_alternate_screen) {
             self.status_line
                 .draw(stdout, self.size.cols, self.size.rows)?;
             renderer.write_cursor(stdout, vt)?;
