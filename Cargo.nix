@@ -7258,7 +7258,7 @@ rec {
         features = {
           "test-all" = [ "test-pty" "deterministic-tui" ];
         };
-        resolvedDefaultFeatures = [ "default" "deterministic-tui" "test-all" "test-pty" ];
+        resolvedDefaultFeatures = [ "bench-internals" "default" "deterministic-tui" "test-all" "test-pty" ];
       };
       "devenv-snix-backend" = rec {
         crateName = "devenv-snix-backend";
