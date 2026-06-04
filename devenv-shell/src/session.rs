@@ -93,6 +93,24 @@ fn dump_row_from_cells(buf: &mut String, vt: &Terminal<'_, '_>, point: Point, ce
     }
 }
 
+/// Whether every cell in a row is blank — no text, no styling, no background
+/// fill — i.e. `dump_row_from_cells` would emit nothing for it. Mirrors the
+/// per-cell blank test there (lines `!has_text && !has_styling && !is_bg_only`).
+/// Unknown queries count as non-blank so we redraw to stay correct. Used by the
+/// post-clear fast path: after a single native CSI 2J blanks the real screen,
+/// rows that read back blank need no per-row redraw.
+fn is_blank_cells(cells: &[Cell]) -> bool {
+    cells.iter().all(|cell| {
+        let has_text = cell.has_text().unwrap_or(true);
+        let has_styling = cell.has_styling().unwrap_or(true);
+        let is_bg_only = matches!(
+            cell.content_tag().ok(),
+            Some(CellContentTag::BgColorPalette | CellContentTag::BgColorRgb)
+        );
+        !has_text && !has_styling && !is_bg_only
+    })
+}
+
 fn cell_style(
     cell: &Cell,
     cell_ref: &GridRef<'_>,
@@ -234,6 +252,11 @@ struct Renderer {
     /// Force the next render to redraw every row regardless of dirty tracking
     /// (set on invalidate: alt-screen toggle, resize, scroll, handoff).
     force_full: bool,
+    /// Set by `native_clear` when a one-shot CSI 2J was emitted this batch.
+    /// Makes the next `render` suppress the per-row redraw of rows that read
+    /// back blank (the native clear already blanked them), so a full-screen
+    /// erase costs one escape instead of a MoveTo+Clear+reset per row.
+    cleared: bool,
 }
 
 impl Renderer {
@@ -251,6 +274,7 @@ impl Renderer {
             line_buf: String::new(),
             render_state: RenderState::new()?,
             force_full: false,
+            cleared: false,
         })
     }
 
@@ -354,6 +378,7 @@ impl Renderer {
         let limit = rows.min(max_row);
 
         let force = std::mem::take(&mut self.force_full);
+        let cleared = std::mem::take(&mut self.cleared);
         let dirty = self.collect_dirty(vt, limit);
 
         for row_idx in 0..limit {
@@ -364,6 +389,18 @@ impl Renderer {
             }
             let point = active_point(row_idx as u32);
             let cells = cells_in_row(vt, point);
+            // Post native-clear: the real screen was just blanked by one CSI 2J,
+            // so any row that reads back blank needs no per-row redraw. Record
+            // the real (blank) cells as the new baseline so the next frame still
+            // diffs correctly.
+            if cleared && is_blank_cells(&cells) {
+                crate::perf::record_row(false);
+                if row_idx >= self.prev_lines.len() {
+                    self.prev_lines.resize_with(row_idx + 1, Vec::new);
+                }
+                self.prev_lines[row_idx] = cells;
+                continue;
+            }
             if row_idx < self.prev_lines.len() && cells == self.prev_lines[row_idx] {
                 crate::perf::record_row(false);
                 continue;
@@ -494,6 +531,26 @@ impl Renderer {
     ) -> io::Result<()> {
         self.invalidate();
         self.render(stdout, vt)
+    }
+
+    /// Mirror a full-screen erase (CSI 2J) with a single native clear instead
+    /// of repainting every row. Emits one `Clear(All)` + home, resets the diff
+    /// baseline to "screen is blank", and sets `cleared` so the following
+    /// `render` redraws only the rows that still have content (e.g. the prompt)
+    /// and skips the now-blank ones. Deliberately does *not* call `invalidate`:
+    /// `force_full` would force-read every row and defeat the dirty skip on the
+    /// frames that follow. Cursor visibility is preserved (only `update_cursor`
+    /// emits Show/Hide, by diffing against `prev_cursor`).
+    fn native_clear(&mut self, stdout: &mut impl Write) -> io::Result<()> {
+        queue!(stdout, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        self.prev_lines.clear();
+        self.prev_cursor = CursorState {
+            col: 0,
+            row: 0,
+            visible: self.prev_cursor.visible,
+        };
+        self.cleared = true;
+        Ok(())
     }
 
     /// Position the real terminal cursor to match the VT cursor.
@@ -1364,6 +1421,24 @@ impl ShellSession {
                         queue!(stdout, Clear(ClearType::Purge))?;
                     }
 
+                    // Full-screen erase fast-path: when the inner program cleared
+                    // the whole viewport (CSI 2J) on the primary screen, mirror it
+                    // with a single native clear instead of repainting every row.
+                    // render() then redraws only the rows with content (e.g. the
+                    // prompt) and skips the now-blank ones. Gated off in alt-screen
+                    // (a nested TUI owns and refills that buffer, so the clear is
+                    // pure overhead there) and during the row_offset hand-off phase
+                    // (the offset block above scrolls old content into scrollback
+                    // first). Legacy mode keeps the full per-row redraw.
+                    if !crate::perf::legacy()
+                        && esc.erase_display
+                        && !esc.in_alternate_screen
+                        && renderer.row_offset == 0
+                    {
+                        renderer.native_clear(stdout)?;
+                        self.status_line.mark_dirty();
+                    }
+
                     let t = crate::perf::enabled().then(Instant::now);
                     if esc.in_alternate_screen || renderer.row_offset > 0 {
                         renderer.render(stdout, vt)?;
@@ -1719,7 +1794,21 @@ impl RenderHarness {
                 self.renderer.invalidate();
             }
         }
-
+        // Mirror the event loop's full-screen-erase fast-path so the bench
+        // measures it (see `event_loop`). The harness has no offset/3J handling,
+        // so the gate is just the primary-screen 2J case.
+        if !crate::perf::legacy()
+            && self.esc.erase_display
+            && !self.esc.in_alternate_screen
+            && self.renderer.row_offset == 0
+        {
+            self.renderer
+                .native_clear(&mut self.out)
+                .expect("native clear");
+            if let Some(status) = &mut self.status {
+                status.mark_dirty();
+            }
+        }
         if self.esc.in_alternate_screen || self.renderer.row_offset > 0 {
             self.renderer
                 .render(&mut self.out, &self.vt)
@@ -1919,6 +2008,61 @@ mod tests {
             "single-cell change should dirty a small subset, got {n3}"
         );
         assert_eq!(n4, 0, "update should consume grid dirty again, got {n4}");
+    }
+
+    /// The full-screen-erase fast-path: after a screen of content, a CSI 2J +
+    /// prompt is re-emitted as a SINGLE native clear plus the prompt row — not a
+    /// per-row MoveTo+Clear(CurrentLine) for every blank row (the slow path this
+    /// optimizes away). Blank rows are skipped; the prompt row still renders.
+    #[test]
+    fn native_clear_collapses_full_erase() {
+        fn count(haystack: &[u8], needle: &[u8]) -> usize {
+            haystack
+                .windows(needle.len())
+                .filter(|w| *w == needle)
+                .count()
+        }
+
+        let mut vt: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: DEFAULT_MAX_SCROLLBACK,
+        })
+        .unwrap();
+        let mut renderer = Renderer::new(24).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+
+        // Fill the viewport, render it as the baseline.
+        for r in 1..=24 {
+            feed_vt(&mut vt, &format!("\x1b[{r};1Hrow {r} content here"));
+        }
+        renderer.render_full(&mut out, &vt).unwrap();
+        out.clear();
+
+        // Clear the whole screen and draw a prompt, the way `clear`/Ctrl-L does.
+        feed_vt(&mut vt, "\x1b[2J\x1b[Huser@host:~$ ");
+        renderer.native_clear(&mut out).unwrap();
+        renderer.render(&mut out, &vt).unwrap();
+
+        assert_eq!(
+            count(&out, b"\x1b[2J"),
+            1,
+            "expected exactly one native screen clear, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        // Only the (single) prompt row gets a per-line clear; the 23 blank rows
+        // are skipped. The slow path would emit ~24 of these.
+        assert_eq!(
+            count(&out, b"\x1b[2K"),
+            1,
+            "blank rows must be skipped, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            out.windows(12).any(|w| w == b"user@host:~$"),
+            "prompt row must still be drawn, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     /// Regression test for devenv#2845: when the process-wide shutdown token is

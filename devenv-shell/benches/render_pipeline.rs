@@ -167,6 +167,36 @@ fn gen_cjk_wide(cols: u16, rows: u16, frames: usize) -> Vec<Vec<u8>> {
     out
 }
 
+/// Primary-screen clear storm: alternate a full-viewport repaint with a
+/// CSI 2J + home + short prompt. Models a screen full of output then `clear` /
+/// Ctrl-L — the case devenv re-renders row-by-row (every row dirty, all blank)
+/// where a native terminal does a single 2J. The clear frames (odd) are where
+/// the fast-path wins; the fill frames (even) leave content for the next clear
+/// to erase. No alt-screen and positioned writes keep it on the primary
+/// viewport so the render_with_scroll path is exercised.
+fn gen_clear_storm(cols: u16, rows: u16, frames: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(frames);
+    for fi in 0..frames {
+        let mut b = Vec::new();
+        if fi % 2 == 0 {
+            for r in 0..rows {
+                let color = 16 + ((r as u32 + fi as u32) % 200);
+                write!(b, "\x1b[{};1H\x1b[38;5;{color}m", r + 1).unwrap();
+                for c in 0..cols {
+                    let ch = b'!' + (((c as u32 + r as u32 + fi as u32) % 90) as u8);
+                    b.push(ch);
+                }
+            }
+            b.extend_from_slice(b"\x1b[0m\x1b[H");
+        } else {
+            b.extend_from_slice(b"\x1b[2J\x1b[H");
+            b.extend_from_slice(b"user@host:~/project$ ");
+        }
+        out.push(b);
+    }
+    out
+}
+
 fn synthetic_corpora(cols: u16, rows: u16) -> Vec<Corpus> {
     let mk = |name: &str, status: bool, frames: Vec<Vec<u8>>| Corpus {
         name: name.to_string(),
@@ -199,6 +229,8 @@ fn synthetic_corpora(cols: u16, rows: u16) -> Vec<Corpus> {
         mk("scroll_flood+status", true, gen_scroll_flood(cols, 600)),
         mk("heavy_sgr", false, gen_heavy_sgr(cols, rows, 150)),
         mk("cjk_wide", false, gen_cjk_wide(cols, rows, 150)),
+        mk("clear_storm", false, gen_clear_storm(cols, rows, 200)),
+        mk("clear_storm+status", true, gen_clear_storm(cols, rows, 200)),
     ]
 }
 

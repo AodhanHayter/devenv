@@ -33,6 +33,7 @@
 - Bumped secretspec to 0.11, which adds a `[providers]` alias map in `secretspec.toml` and support for a key prefix in the AWS Secrets Manager provider.
 - Added a `--include-envrc` flag to `devenv init` (also settable via `DEVENV_INCLUDE_ENVRC`) to scaffold a direnv `.envrc` file. By default `devenv init` no longer creates an `.envrc` ([#2859](https://github.com/cachix/devenv/pull/2859)).
 - `devenv shell` no longer slows down full-screen terminal programs (Neovim, editors, other TUIs) running inside it. While such a program owns the screen, devenv now passes its output straight through to the terminal instead of re-rendering every frame through its emulator, so nested apps run at native speed — roughly 10–30× less per-frame work, and the gain grows with terminal size (largest on 4K/high-resolution screens). The status line is hidden while a full-screen app is active so it no longer competes for the bottom row. Set `DEVENV_SHELL_PASSTHROUGH=0` to fall back to the re-rendering path.
+- Clearing the screen inside `devenv shell` (`clear`, Ctrl-L) is now fast: instead of repainting every row one by one, the shell clears the terminal in a single operation and only redraws the prompt, matching the speed of clearing outside the shell.
 
 ### Breaking Changes
 
