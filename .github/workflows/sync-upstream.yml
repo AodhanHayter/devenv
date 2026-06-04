@@ -1,0 +1,29 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily 06:00 UTC
+  workflow_dispatch: # manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    # Only run on the fork, not upstream
+    if: github.repository == 'AodhanHayter/devenv'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebase fork main onto upstream main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/cachix/devenv.git
+          git fetch upstream main
+          git rebase upstream/main
+          git push --force-with-lease origin main
