@@ -35,6 +35,7 @@ pub fn screen_point(y: u32) -> Point {
 /// Get all cells in a row by iterating columns via grid ref.
 pub fn cells_in_row(vt: &Terminal<'_, '_>, point: Point) -> Vec<Cell> {
     let cols = vt.cols().unwrap_or(0);
+    crate::perf::record_cell_reads(cols as usize);
     (0..cols)
         .filter_map(|x| vt.grid_ref(point_with_x(point, x)).ok()?.cell().ok())
         .collect()

@@ -318,6 +318,10 @@ pub struct StatusLine {
     spinner_frame: usize,
     /// Last time the spinner frame was updated
     last_spinner_update: Instant,
+    /// Bytes emitted by the last `draw` (after layout/render), used to skip a
+    /// redraw when the rendered content is byte-identical to the previous frame.
+    /// `None` forces the next draw (e.g. after the row may have been clobbered).
+    last_drawn: Option<Vec<u8>>,
 }
 
 impl StatusLine {
@@ -328,7 +332,14 @@ impl StatusLine {
             enabled: true,
             spinner_frame: 0,
             last_spinner_update: Instant::now(),
+            last_drawn: None,
         }
+    }
+
+    /// Force the next `draw` to emit even if the content is unchanged. Call when
+    /// the status row may have been overwritten (alt-screen exit, resize).
+    pub fn mark_dirty(&mut self) {
+        self.last_drawn = None;
     }
 
     /// Advance spinner animation if enough time has passed.
@@ -371,9 +382,21 @@ impl StatusLine {
     /// Draw the status line at the given row of the terminal.
     ///
     /// The caller is responsible for repositioning the cursor after this call.
-    pub fn draw(&mut self, stdout: &mut impl Write, cols: u16, total_rows: u16) -> io::Result<()> {
+    /// Draw the status line on the last row. Returns `true` if it actually
+    /// emitted, `false` if it skipped because the rendered content was identical
+    /// to the previous draw (the row is already correct). Building the iocraft
+    /// element tree and laying it out is the expensive part, so the skip check
+    /// happens after rendering the content but before the comparatively cheap
+    /// MoveTo/Clear/write — the layout still runs, but the redundant terminal
+    /// writes (and the visual no-op) are avoided.
+    pub fn draw(
+        &mut self,
+        stdout: &mut impl Write,
+        cols: u16,
+        total_rows: u16,
+    ) -> io::Result<bool> {
         if !self.enabled {
-            return Ok(());
+            return Ok(false);
         }
 
         // Update spinner animation
@@ -389,6 +412,13 @@ impl StatusLine {
             content.truncate(pos);
         }
 
+        // Skip the redraw when the content is byte-identical to last time — the
+        // status row was protected by render's scroll region and still shows it.
+        // Legacy mode forces the redraw (pre-optimization before/after baseline).
+        if !crate::perf::legacy() && self.last_drawn.as_deref() == Some(content.as_slice()) {
+            return Ok(false);
+        }
+
         // Move to the last row, clear it, write content
         queue!(
             stdout,
@@ -398,7 +428,8 @@ impl StatusLine {
         stdout.write_all(&content)?;
         queue!(stdout, ResetColor)?;
 
-        Ok(())
+        self.last_drawn = Some(content);
+        Ok(true)
     }
 
     /// Build the status line element.

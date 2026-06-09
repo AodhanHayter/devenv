@@ -25,6 +25,7 @@ use crossterm::{
     style::ResetColor,
     terminal::{self, Clear, ClearType},
 };
+use libghostty_vt::render::RenderState;
 use libghostty_vt::screen::{Cell, CellContentTag, CellWide, GridRef};
 use libghostty_vt::style::{Style, StyleColor, Underline};
 use libghostty_vt::terminal::{Options as TerminalOptions, Point, Terminal};
@@ -32,7 +33,7 @@ use portable_pty::PtySize;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Read, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -226,11 +227,18 @@ struct Renderer {
     scrollback_flushed: usize,
     /// Reusable buffer for SGR line rendering (avoids per-line allocation).
     line_buf: String,
+    /// libghostty render state, reused across frames. `update` consumes the
+    /// terminal's per-row dirty bits so the next frame only reports rows that
+    /// changed, letting render skip the cell readback for unchanged rows.
+    render_state: RenderState<'static>,
+    /// Force the next render to redraw every row regardless of dirty tracking
+    /// (set on invalidate: alt-screen toggle, resize, scroll, handoff).
+    force_full: bool,
 }
 
 impl Renderer {
-    fn new(content_rows: u16) -> Self {
-        Self {
+    fn new(content_rows: u16) -> Result<Self, libghostty_vt::Error> {
+        Ok(Self {
             prev_lines: Vec::new(),
             prev_cursor: CursorState {
                 col: 0,
@@ -241,7 +249,9 @@ impl Renderer {
             content_rows,
             scrollback_flushed: 0,
             line_buf: String::new(),
-        }
+            render_state: RenderState::new()?,
+            force_full: false,
+        })
     }
 
     /// Discard any VT scrollback without emitting it to the native terminal
@@ -304,18 +314,61 @@ impl Renderer {
         queue!(stdout, ResetColor)
     }
 
-    /// Render changed VT lines to stdout. Skips lines that haven't changed
-    /// and clips rows that would fall outside the visible area.
-    fn render(&mut self, stdout: &mut impl Write, vt: &Terminal<'_, '_>) -> io::Result<()> {
+    /// Read each viewport row's dirty flag from the VT grid (one cheap FFI
+    /// probe per row, vs reading every cell), then consume the terminal's dirty
+    /// state via `RenderState::update` so the next frame sees only newly-changed
+    /// rows. Returns, per row in `0..limit`, whether it changed since last call.
+    fn collect_dirty(&mut self, vt: &Terminal<'static, 'static>, limit: usize) -> Vec<bool> {
+        // Legacy mode: every row dirty, no render-state update — reproduces the
+        // pre-optimization full-screen readback for before/after benchmarking.
+        if crate::perf::legacy() {
+            return vec![true; limit];
+        }
+        let dirty: Vec<bool> = (0..limit)
+            .map(|row_idx| {
+                vt.grid_ref(active_point(row_idx as u32))
+                    .ok()
+                    .and_then(|g| g.row().ok())
+                    .and_then(|r| r.is_dirty().ok())
+                    // Unknown dirtiness → redraw to stay correct.
+                    .unwrap_or(true)
+            })
+            .collect();
+        // Consume the grid dirty bits so the next frame only reports new changes.
+        let _ = self.render_state.update(vt);
+        dirty
+    }
+
+    /// Render changed VT lines to stdout. Uses libghostty per-row dirty tracking
+    /// to read back cells only for rows that changed (the rest are skipped
+    /// without a cell read), clips rows outside the visible area, and keeps a
+    /// `prev_lines` content compare as a safety net for the emit decision.
+    fn render(
+        &mut self,
+        stdout: &mut impl Write,
+        vt: &Terminal<'static, 'static>,
+    ) -> io::Result<()> {
         let offset = self.row_offset as usize;
         let max_row = self.visible_rows();
         let rows = vt.rows().unwrap_or(0) as usize;
-        for row_idx in 0..rows.min(max_row) {
+        let limit = rows.min(max_row);
+
+        let force = std::mem::take(&mut self.force_full);
+        let dirty = self.collect_dirty(vt, limit);
+
+        for row_idx in 0..limit {
+            if !force && !dirty.get(row_idx).copied().unwrap_or(true) {
+                // libghostty says this row is unchanged — skip the cell readback.
+                crate::perf::record_row(false);
+                continue;
+            }
             let point = active_point(row_idx as u32);
             let cells = cells_in_row(vt, point);
             if row_idx < self.prev_lines.len() && cells == self.prev_lines[row_idx] {
+                crate::perf::record_row(false);
                 continue;
             }
+            crate::perf::record_row(true);
             queue!(
                 stdout,
                 cursor::MoveTo(0, (row_idx + offset) as u16),
@@ -340,7 +393,7 @@ impl Renderer {
     fn render_with_scroll(
         &mut self,
         stdout: &mut impl Write,
-        vt: &mut Terminal<'_, '_>,
+        vt: &mut Terminal<'static, 'static>,
     ) -> io::Result<()> {
         let vt_scrollback = vt.scrollback_rows().unwrap_or(0);
         let unflushed = vt_scrollback.saturating_sub(self.scrollback_flushed);
@@ -426,13 +479,19 @@ impl Renderer {
             // `Screen.zig::eraseHistory`.
             vt.vt_write(b"\x1b[3J");
             self.scrollback_flushed = 0;
-            self.prev_lines.clear();
+            // The viewport scrolled on the real terminal; force a full redraw
+            // (clears prev_lines and overrides dirty tracking for this frame).
+            self.invalidate();
         }
         self.render(stdout, vt)
     }
 
     /// Full redraw of all VT lines (after resize or initialization).
-    fn render_full(&mut self, stdout: &mut impl Write, vt: &Terminal<'_, '_>) -> io::Result<()> {
+    fn render_full(
+        &mut self,
+        stdout: &mut impl Write,
+        vt: &Terminal<'static, 'static>,
+    ) -> io::Result<()> {
         self.invalidate();
         self.render(stdout, vt)
     }
@@ -469,9 +528,11 @@ impl Renderer {
         )
     }
 
-    /// Mark all lines as stale so the next render redraws everything.
+    /// Mark all lines as stale so the next render redraws everything,
+    /// overriding dirty tracking for that frame.
     fn invalidate(&mut self) {
         self.prev_lines.clear();
+        self.force_full = true;
     }
 
     /// Snapshot VT state into prev_lines without writing anything to stdout.
@@ -686,9 +747,27 @@ impl ShellSession {
         let _raw_guard = RawModeGuard::new()?;
         tracing::trace!("session: raw mode active");
 
+        crate::perf::init_from_env();
+
         let injected_stdin = io.stdin.is_some();
         let stdout_raw: Box<dyn Write + Send> = io.stdout.unwrap_or_else(|| Box::new(io::stdout()));
-        let mut stdout: Box<dyn Write + Send> = Box::new(io::BufWriter::new(stdout_raw));
+        // CountingWriter sits between the BufWriter and the real terminal fd so
+        // the perf profiler sees the bytes/syscalls actually reaching the
+        // terminal (including mid-frame BufWriter auto-flushes).
+        //
+        // 256 KiB capacity so a full-screen repaint with dense SGR doesn't
+        // overflow the default 8 KiB buffer and auto-flush mid-frame (extra
+        // blocking write() syscalls that also split the synchronized update).
+        // Legacy mode uses the old small buffer for a faithful before/after.
+        let stdout_cap = if crate::perf::legacy() {
+            8 * 1024
+        } else {
+            256 * 1024
+        };
+        let mut stdout: Box<dyn Write + Send> = Box::new(io::BufWriter::with_capacity(
+            stdout_cap,
+            crate::perf::CountingWriter::new(stdout_raw),
+        ));
         let stdin_source: Box<dyn Read + Send> = io.stdin.unwrap_or_else(|| Box::new(io::stdin()));
 
         // Query cursor position FIRST before any terminal resets.
@@ -796,7 +875,17 @@ impl ShellSession {
         std::thread::Builder::new()
             .name("session-pty".into())
             .spawn(move || {
-                let mut buf = [0u8; 4096];
+                // 64 KiB so a single full-screen TUI frame (often >4 KiB) is
+                // delivered in one read instead of fragmenting into many
+                // syscalls, allocations, channel sends, and scan/accumulate
+                // passes. Heap-allocated to keep the thread stack small.
+                // Legacy mode uses the old 4 KiB buffer for a faithful A/B.
+                let buf_len = if crate::perf::legacy() {
+                    4096
+                } else {
+                    64 * 1024
+                };
+                let mut buf = vec![0u8; buf_len];
                 loop {
                     match pty_reader.read(&mut buf) {
                         Ok(0) => {
@@ -854,8 +943,10 @@ impl ShellSession {
         let coordinator_tx = event_tx.clone();
         let pty_for_thread = Arc::clone(&pty);
         let vt_handle = std::thread::spawn(move || -> Result<Option<u32>, SessionError> {
-            // Create the VT on this thread (Terminal is !Send)
-            let mut vt = Terminal::new(TerminalOptions {
+            // Create the VT on this thread (Terminal is !Send). Owned with a
+            // NULL allocator, so its lifetimes are 'static — required to store a
+            // RenderState alongside it in the Renderer.
+            let mut vt: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
                 cols: pty_size.cols,
                 rows: pty_size.rows,
                 max_scrollback: DEFAULT_MAX_SCROLLBACK,
@@ -871,7 +962,7 @@ impl ShellSession {
             vt.vt_write(b"\x1b[2J\x1b[H");
 
             // Initialize the renderer and do a full initial draw
-            let mut renderer = Renderer::new(pty_size.rows);
+            let mut renderer = Renderer::new(pty_size.rows)?;
             if row_offset > 0 {
                 renderer.row_offset = row_offset;
                 renderer.sync(&vt);
@@ -896,11 +987,14 @@ impl ShellSession {
         });
 
         // Wait for VT thread without blocking the tokio runtime
+        let session_start = Instant::now();
         let exit_code = tokio::task::spawn_blocking(move || {
             vt_handle.join().unwrap_or(Err(SessionError::ChannelClosed))
         })
         .await
         .map_err(|_| SessionError::ChannelClosed)??;
+        crate::perf::add_session(session_start.elapsed());
+        crate::perf::dump();
 
         let _ = pty.kill();
 
@@ -917,7 +1011,7 @@ impl ShellSession {
     fn event_loop(
         &mut self,
         pty: &Arc<Pty>,
-        vt: &mut Terminal<'_, '_>,
+        vt: &mut Terminal<'static, 'static>,
         renderer: &mut Renderer,
         event_rx: std::sync::mpsc::Receiver<Event>,
         coordinator_tx: &tokio_mpsc::Sender<ShellEvent>,
@@ -939,7 +1033,9 @@ impl ShellSession {
                 match event_rx.recv_timeout(spinner_interval) {
                     Ok(event) => Some(event),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if self.config.show_status_line {
+                        if self.config.show_status_line
+                            && (crate::perf::legacy() || !esc.in_alternate_screen)
+                        {
                             queue!(stdout, terminal::BeginSynchronizedUpdate)?;
                             self.status_line
                                 .draw(stdout, self.size.cols, self.size.rows)?;
@@ -956,7 +1052,9 @@ impl ShellSession {
                     Ok(event) => Some(event),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         self.status_line.state_mut().clear_reloaded();
-                        if self.config.show_status_line {
+                        if self.config.show_status_line
+                            && (crate::perf::legacy() || !esc.in_alternate_screen)
+                        {
                             queue!(stdout, terminal::BeginSynchronizedUpdate)?;
                             self.status_line
                                 .draw(stdout, self.size.cols, self.size.rows)?;
@@ -1028,35 +1126,55 @@ impl ShellSession {
                 Event::PtyOutput(data) => {
                     let was_in_alt = esc.in_alternate_screen;
                     esc.reset_batch();
+                    let mut perf_bytes_in = data.len();
+                    let mut perf_chunks = 1usize;
+                    let t = crate::perf::enabled().then(Instant::now);
                     escape_state_process(
                         &mut scanner,
                         &data,
                         &mut esc,
                         stdout,
-                        pty,
+                        &**pty,
                         self.pty_size(),
                         &mut esc_events,
                     )?;
+                    if let Some(t) = t {
+                        crate::perf::add_scan(t.elapsed());
+                    }
 
                     // Feed output into VT and track how many lines scrolled off
                     let text = utf8_acc.accumulate(&data);
+                    let t = crate::perf::enabled().then(Instant::now);
                     let mut total_scroll = feed_vt(vt, &text);
+                    if let Some(t) = t {
+                        crate::perf::add_vt(t.elapsed());
+                    }
 
                     // Batch: drain any additional pending PtyOutput events
                     while let Ok(event) = event_rx.try_recv() {
                         match event {
                             Event::PtyOutput(more) => {
+                                perf_bytes_in += more.len();
+                                perf_chunks += 1;
+                                let t = crate::perf::enabled().then(Instant::now);
                                 escape_state_process(
                                     &mut scanner,
                                     &more,
                                     &mut esc,
                                     stdout,
-                                    pty,
+                                    &**pty,
                                     self.pty_size(),
                                     &mut esc_events,
                                 )?;
+                                if let Some(t) = t {
+                                    crate::perf::add_scan(t.elapsed());
+                                }
                                 let text = utf8_acc.accumulate(&more);
+                                let t = crate::perf::enabled().then(Instant::now);
                                 total_scroll += feed_vt(vt, &text);
+                                if let Some(t) = t {
+                                    crate::perf::add_vt(t.elapsed());
+                                }
                             }
                             Event::PtyExit(exit_code) => {
                                 escape_state_cleanup(&esc, stdout)?;
@@ -1086,6 +1204,10 @@ impl ShellSession {
                     // Handle alternate screen transitions
                     if was_in_alt != esc.in_alternate_screen {
                         renderer.invalidate();
+                        // The status line is suppressed while in alt-screen, so
+                        // force a redraw on the way back to the primary buffer
+                        // (where the row may be stale).
+                        self.status_line.mark_dirty();
                     }
 
                     // Consume offset if needed: when cursor would land
@@ -1117,21 +1239,38 @@ impl ShellSession {
                         queue!(stdout, Clear(ClearType::Purge))?;
                     }
 
+                    let t = crate::perf::enabled().then(Instant::now);
                     if esc.in_alternate_screen || renderer.row_offset > 0 {
                         renderer.render(stdout, vt)?;
                     } else {
                         renderer.render_with_scroll(stdout, vt)?;
                     }
+                    if let Some(t) = t {
+                        crate::perf::add_render(t.elapsed());
+                    }
 
-                    if self.config.show_status_line {
-                        self.status_line
+                    // Suppress the status line while a nested app owns the
+                    // alt-screen — it would fight the TUI for the bottom row and
+                    // cost an iocraft layout + redraw every frame. (Legacy mode
+                    // keeps drawing it for a faithful before/after.)
+                    if self.config.show_status_line
+                        && (crate::perf::legacy() || !esc.in_alternate_screen)
+                    {
+                        let t = crate::perf::enabled().then(Instant::now);
+                        let drew = self
+                            .status_line
                             .draw(stdout, self.size.cols, self.size.rows)?;
+                        if let Some(t) = t {
+                            crate::perf::add_status(t.elapsed());
+                        }
+                        crate::perf::record_status(drew);
                     }
                     renderer.write_cursor(stdout, vt)?;
 
                     // End synchronized output and flush.
                     queue!(stdout, terminal::EndSynchronizedUpdate)?;
                     stdout.flush()?;
+                    crate::perf::record_batch(perf_bytes_in, perf_chunks);
                 }
 
                 Event::PtyExit(exit_code) => {
@@ -1149,7 +1288,7 @@ impl ShellSession {
                     } else {
                         renderer.render_with_scroll(stdout, vt)?;
                     }
-                    self.draw_status_and_cursor(stdout, vt, renderer)?;
+                    self.draw_status_and_cursor(stdout, vt, renderer, esc.in_alternate_screen)?;
                     queue!(stdout, terminal::EndSynchronizedUpdate)?;
                     stdout.flush()?;
                 }
@@ -1188,6 +1327,9 @@ impl ShellSession {
                         }
                         renderer.discard_vt_scrollback(vt);
                         renderer.render_full(stdout, vt)?;
+                        // Row geometry changed — force a status redraw even if the
+                        // content text is unchanged.
+                        self.status_line.mark_dirty();
                         if self.config.show_status_line && !esc.in_alternate_screen {
                             self.status_line.draw(stdout, cols, rows)?;
                         }
@@ -1280,8 +1422,11 @@ impl ShellSession {
         stdout: &mut impl Write,
         vt: &Terminal<'_, '_>,
         renderer: &Renderer,
+        in_alternate_screen: bool,
     ) -> Result<(), SessionError> {
-        if self.config.show_status_line {
+        // Suppressed in alt-screen; render already positioned the cursor there.
+        // (Legacy mode keeps drawing it for a faithful before/after.)
+        if self.config.show_status_line && (crate::perf::legacy() || !in_alternate_screen) {
             self.status_line
                 .draw(stdout, self.size.cols, self.size.rows)?;
             renderer.write_cursor(stdout, vt)?;
@@ -1315,10 +1460,178 @@ impl Default for ShellSession {
     }
 }
 
+/// PTY-free driver for the per-batch render pipeline, used by benches to push a
+/// fixed byte stream through scan → vt_write → render → status into an in-memory
+/// sink. Mirrors the `Event::PtyOutput` arm of [`ShellSession::event_loop`]
+/// without the PTY, threads, or channels so the core render cost can be measured
+/// deterministically. Feed inputs must not contain a TextAreaSizeQuery (CSI 18t);
+/// the no-op responder simply drops any reply.
+#[cfg(feature = "bench-internals")]
+pub struct RenderHarness {
+    vt: Terminal<'static, 'static>,
+    renderer: Renderer,
+    scanner: EscapeScanner,
+    utf8_acc: Utf8Accumulator,
+    esc: EscapeState,
+    status: Option<StatusLine>,
+    esc_events: Vec<crate::escape::SequenceEvent>,
+    size: PtySize,
+    out: Vec<u8>,
+}
+
+#[cfg(feature = "bench-internals")]
+struct NoResponder;
+
+#[cfg(feature = "bench-internals")]
+impl crate::escape_state::QueryResponder for NoResponder {
+    fn respond(&self, _bytes: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl RenderHarness {
+    /// Build a harness for a `cols`x`rows` terminal. `status_line` toggles the
+    /// per-batch status-line draw so its cost can be isolated.
+    pub fn new(cols: u16, rows: u16, status_line: bool) -> Self {
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut vt = Terminal::new(TerminalOptions {
+            cols,
+            rows,
+            max_scrollback: DEFAULT_MAX_SCROLLBACK,
+        })
+        .expect("create VT");
+        vt.vt_write(b"\x1b[2J\x1b[H");
+        // StatusLine::new() is enabled by default; render the realistic
+        // "watching N files" idle line so the bench captures its layout cost.
+        let status = status_line.then(|| {
+            let mut s = StatusLine::new();
+            s.state_mut().set_watched_file_count(3);
+            s
+        });
+        Self {
+            vt,
+            renderer: Renderer::new(rows).expect("create renderer"),
+            scanner: EscapeScanner::new(),
+            utf8_acc: Utf8Accumulator::new(),
+            esc: EscapeState::new(),
+            status,
+            esc_events: Vec::new(),
+            size,
+            out: Vec::with_capacity(64 * 1024),
+        }
+    }
+
+    /// Push one chunk of inner-program output through the full pipeline,
+    /// appending the re-emitted terminal bytes to the internal sink.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        let was_in_alt = self.esc.in_alternate_screen;
+        self.esc.reset_batch();
+        escape_state_process(
+            &mut self.scanner,
+            chunk,
+            &mut self.esc,
+            &mut self.out,
+            &NoResponder,
+            self.size,
+            &mut self.esc_events,
+        )
+        .expect("scan");
+        let text = self.utf8_acc.accumulate(chunk);
+        feed_vt(&mut self.vt, &text);
+
+        if was_in_alt != self.esc.in_alternate_screen {
+            self.renderer.invalidate();
+        }
+        if self.esc.in_alternate_screen || self.renderer.row_offset > 0 {
+            self.renderer
+                .render(&mut self.out, &self.vt)
+                .expect("render");
+        } else {
+            self.renderer
+                .render_with_scroll(&mut self.out, &mut self.vt)
+                .expect("render");
+        }
+        // Mirror the session: the status line is suppressed in alt-screen
+        // (legacy mode draws it every frame regardless, for before/after).
+        if let Some(status) = &mut self.status {
+            if crate::perf::legacy() || !self.esc.in_alternate_screen {
+                status
+                    .draw(&mut self.out, self.size.cols, self.size.rows)
+                    .expect("status");
+            }
+        }
+        self.renderer
+            .write_cursor(&mut self.out, &self.vt)
+            .expect("cursor");
+    }
+
+    /// Total bytes re-emitted so far (the numerator of output amplification).
+    pub fn output_len(&self) -> usize {
+        self.out.len()
+    }
+
+    /// Drop accumulated output without resetting VT/renderer state.
+    pub fn reset_output(&mut self) {
+        self.out.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use portable_pty::CommandBuilder;
+
+    /// Nails the libghostty dirty-tracking protocol the renderer depends on:
+    /// reading per-row grid dirty then consuming it via RenderState::update so
+    /// the next unchanged frame is clean and a single-cell change dirties one row.
+    #[test]
+    fn grid_dirty_is_consumed_by_update() {
+        let mut vt: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: DEFAULT_MAX_SCROLLBACK,
+        })
+        .unwrap();
+        let mut rs = RenderState::new().unwrap();
+
+        fn count_grid_dirty(vt: &Terminal<'static, 'static>, rows: u16) -> u32 {
+            (0..rows)
+                .filter(|&y| {
+                    vt.grid_ref(active_point(y as u32))
+                        .ok()
+                        .and_then(|g| g.row().ok())
+                        .and_then(|r| r.is_dirty().ok())
+                        .unwrap_or(true)
+                })
+                .count() as u32
+        }
+
+        vt.vt_write(b"\x1b[2J\x1b[Hhello");
+        let n1 = count_grid_dirty(&vt, 24);
+        let _ = rs.update(&vt); // consume
+        let n2 = count_grid_dirty(&vt, 24);
+
+        vt.vt_write(b"\x1b[10;5HZ");
+        let n3 = count_grid_dirty(&vt, 24);
+        let _ = rs.update(&vt);
+        let n4 = count_grid_dirty(&vt, 24);
+
+        assert!(n1 >= 1, "write should dirty >=1 row, got {n1}");
+        assert_eq!(n2, 0, "update should consume grid dirty, got {n2}");
+        // A 1-cell write dirties the written row (and possibly the cursor's
+        // previous row); the point is it's a small subset, not the whole screen.
+        assert!(
+            (1..=3).contains(&n3),
+            "single-cell change should dirty a small subset, got {n3}"
+        );
+        assert_eq!(n4, 0, "update should consume grid dirty again, got {n4}");
+    }
 
     /// Regression test for devenv#2845: when the process-wide shutdown token is
     /// cancelled (e.g. from the SIGHUP/SIGINT/SIGTERM handler), the inner shell
