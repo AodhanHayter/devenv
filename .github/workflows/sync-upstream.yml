@@ -17,7 +17,11 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # PAT with `workflow` scope. The default GITHUB_TOKEN is forbidden from
+          # pushing changes to .github/workflows/*, so the sync fails whenever
+          # upstream edits a workflow file. The PAT is persisted by checkout and
+          # reused by the push below.
+          token: ${{ secrets.SYNC_TOKEN }}
 
       - name: Rebase fork main onto upstream main
         run: |
