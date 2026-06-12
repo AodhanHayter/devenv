@@ -2578,6 +2578,110 @@ list of string
 
 
 
+## claude.code.plugins
+
+
+
+Claude Code plugins from flake inputs or local paths.
+Plugins are auto-installed via a generated local marketplace.
+
+
+
+*Type:*
+attribute set of (submodule)
+
+
+
+*Default:*
+
+```nix
+{ }
+```
+
+
+
+*Example:*
+
+```nix
+{
+  my-plugin.src = inputs.my-plugin;
+  pr-review = {
+    src = inputs.claude-code-plugins;
+    subdir = "plugins/pr-review-toolkit";
+  };
+}
+
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
+## claude.code.plugins.\<name>.enable
+
+
+
+Whether to enable this plugin.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+true
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
+## claude.code.plugins.\<name>.src
+
+
+
+Path to plugin source (flake input or local path).
+
+
+
+*Type:*
+absolute path
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
+## claude.code.plugins.\<name>.subdir
+
+
+
+Subdirectory within src containing the plugin. Auto-detected if omitted.
+
+
+
+*Type:*
+null or string
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix](https://github.com/cachix/devenv/blob/main/src/modules/integrations/claude.nix)
+
+
+
 ## container.isBuilding
 
 
@@ -2637,8 +2741,6 @@ attribute set of (submodule)
 
 
 ## containers.\<name>.enableLayerDeduplication
-
-
 
 Whether to enable layer deduplication using the approach described at https://blog.eigenvalue.net/2023-nix2container-everything-once/
 .
@@ -2791,6 +2893,8 @@ false
 
 
 ## containers.\<name>.layers
+
+
 
 The layers to create.
 
@@ -5985,8 +6089,6 @@ null or string
 
 ## git-hooks.hooks.autoflake.settings.flags
 
-
-
 Flags passed to autoflake.
 
 
@@ -8257,8 +8359,6 @@ false
 
 
 ## git-hooks.hooks.isort
-
-
 
 isort hook
 
