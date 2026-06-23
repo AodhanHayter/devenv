@@ -6064,8 +6064,6 @@ false
 
 ## git-hooks.hooks.autoflake.settings.binPath
 
-
-
 Path to autoflake binary.
 
 
@@ -6088,6 +6086,8 @@ null or string
 
 
 ## git-hooks.hooks.autoflake.settings.flags
+
+
 
 Flags passed to autoflake.
 
@@ -6150,6 +6150,8 @@ false
 
 
 ## git-hooks.hooks.biome.settings.binPath
+
+
 
 ` biome ` binary path.
 For example, if you want to use the ` biome ` binary from ` node_modules `, use ` "./node_modules/.bin/biome" `.
@@ -8336,8 +8338,6 @@ false
 
 ## git-hooks.hooks.hpack.settings.silent
 
-
-
 Whether generation should be silent.
 
 
@@ -8359,6 +8359,8 @@ false
 
 
 ## git-hooks.hooks.isort
+
+
 
 isort hook
 
@@ -8421,6 +8423,8 @@ string
 
 
 ## git-hooks.hooks.isort.settings.profile
+
+
 
 Built-in profiles to allow easy interoperability with common projects and code styles.
 
